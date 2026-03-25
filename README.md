@@ -11,12 +11,12 @@ This project is based on the excellent work by [xtk](https://github.com/x746b) i
 ## Features
 
 - **Two-Tier Architecture**: Fast Rust engine (memoxide) + Volatility3 fallback for maximum coverage
-- **Cross-Platform**: Support Windows, Linux, and macOS memory dumps
-- **Auto-Detection**: Automatic OS profile detection from memory dumps
+- **Intelligent Caching**: 200-entry cache with LRU eviction (survives until server restart)
+- **Auto-Detection**: Automatic OS profile detection and plugin name resolution
 - **High Performance**: Rust native plugins for common operations (3s vs 60s)
 - **Full Coverage**: Access to 195+ Volatility3 plugins when needed
-- **Memory Efficient**: Streaming processing for large dumps
 - **Smart Routing**: Automatically selects fastest available engine
+- **No Pre-analysis Required**: Plugins auto-analyze image if needed
 
 ## Performance Benchmarks
 
@@ -123,17 +123,42 @@ Run a forensics plugin. Auto-routes to Rust (fast) or Vol3 (fallback).
 
 **Parameters:**
 - `image_path`: Absolute path to memory dump (required)
-- `plugin`: Plugin name (e.g., "windows.pslist.PsList", "linux.netstat.NetStat")
-- `pid`: Filter by process ID (optional)
-- `params`: Plugin-specific parameters (optional, dict)
+- `plugin`: Plugin name - can be short ("pslist") or full ("windows.pslist.PsList")
+- `args`: List of arguments (optional, e.g., ["--pid", "1234", "-r", "json"])
 - `filter`: Server-side filter string (optional)
 
-**Example:**
+**Important Notes:**
+- Use `args` parameter for all plugin arguments
+- Include `-r json` for JSON output (auto-added if not specified)
+- Short plugin names are auto-resolved to full format
+
+**Examples:**
+
 ```json
+// List all processes
 {
   "image_path": "/evidence/memory.raw",
-  "plugin": "windows.pslist.PsList",
+  "plugin": "pslist"
+}
+
+// Dlllist for specific PID
+{
+  "image_path": "/evidence/memory.raw",
+  "plugin": "dlllist",
+  "args": ["--pid", "3692"]
+}
+
+// Filescan with filter
+{
+  "image_path": "/evidence/memory.raw",
+  "plugin": "filescan",
   "filter": "svchost"
+}
+
+// Using full plugin name
+{
+  "image_path": "/evidence/memory.raw",
+  "plugin": "windows.netscan.NetScan"
 }
 ```
 
@@ -162,44 +187,46 @@ Get server status and engine availability.
 
 ### 6. memory_list_dumpable_files
 
-List files that can be extracted from memory cache.
+List files found in memory using filescan plugin.
 
 **Parameters:**
 - `image_path`: Absolute path to memory dump (required)
-- `pid`: Filter by process ID (optional)
+- `args`: Optional args like `["--pid", "1234"]`
 
-### 7. memory_dump_process
+### 7. memory_get_tool_help
 
-Dump a process from memory.
+Get detailed help and examples for any tool.
 
 **Parameters:**
-- `image_path`: Absolute path to memory dump (required)
-- `pid`: Process ID to dump (required)
-- `output_dir`: Output directory (optional, default: "/tmp/memdumps")
-
-**Example:**
-```json
-{
-  "image_path": "/evidence/memory.raw",
-  "pid": 4,
-  "output_dir": "/tmp/extracted"
-}
-```
+- `tool_name`: Name of tool (e.g., "memory_run_plugin")
 
 ## Usage Examples
 
-### Basic Analysis
+### Basic Analysis (Auto-detect)
 
 ```
-Please analyze this memory dump and detect the OS profile.
+Please analyze this memory dump and list all processes.
 File: /evidence/windows.dmp
 ```
 
-### Process Investigation
+The server will:
+1. Auto-analyze the image
+2. Cache the results
+3. Return process list
+
+### Process Investigation with PID Filter
 
 ```
-List all processes in this memory dump and find any suspicious ones.
+Get command line for process ID 1234 from this memory dump.
 File: /evidence/malware.dmp
+```
+
+```json
+{
+  "image_path": "/evidence/malware.dmp",
+  "plugin": "cmdline",
+  "args": ["--pid", "1234"]
+}
 ```
 
 ### Network Analysis
@@ -215,6 +242,28 @@ File: /evidence/c2.dmp
 Scan for injected code (malfind) in this memory dump.
 File: /evidence/suspicious.dmp
 ```
+
+### List Files in Memory
+
+```
+List all files found in memory.
+File: /evidence/windows.dmp
+```
+
+## Caching System
+
+The server includes an intelligent caching system:
+
+- **Cache Size**: 200 entries (configurable)
+- **Cache Key**: `(image_path, plugin, args)`
+- **Persistence**: Cache survives until server restart
+- **Auto-Clear**: Cache cleared when analyzing new image
+- **LRU Eviction**: Oldest entries removed when cache is full
+
+**Benefits:**
+- Second query for same plugin returns instantly
+- No TTL - cache valid until server restart
+- Separate cache per memory dump file
 
 ## Security Features
 
@@ -242,10 +291,10 @@ File: /evidence/suspicious.dmp
                                │                    │ Memory Dump │
                                │                    └─────────────┘
                                ▼
-                        ┌─────────────┐
-                        │ Volatility3 │
-                        │  (Fallback) │
-                        └─────────────┘
+                        ┌─────────────┐     ┌─────────────┐
+                        │    Cache    │────▶│  Volatility3│
+                        │  (200 entries│     │  (Fallback) │
+                        └─────────────┘     └─────────────┘
 ```
 
 ## Project Structure
@@ -259,6 +308,7 @@ mem-forensics-mcp-server/
 │   ├── config.py                # Configuration
 │   ├── core/
 │   │   ├── session.py           # Session management
+│   │   ├── cache.py             # Plugin result caching
 │   │   └── vol3_cli.py          # Vol3 CLI wrapper
 │   ├── engine/
 │   │   ├── memoxide_client.py   # Rust engine client
@@ -311,6 +361,23 @@ Some memory dump formats may not be compatible with certain plugins. Error messa
 ### Timeout errors on large dumps
 
 Rust engine has 60s timeout. For very large dumps, Vol3 fallback will be used automatically.
+
+### Plugin returns "usage: vol.EXE..."
+
+This means the arguments passed are incorrect. Check the plugin's help:
+```
+vol <plugin_name> --help
+```
+
+## Recent Updates
+
+### v0.1.19
+- ✨ Added intelligent caching system (200 entries)
+- ✨ Auto-plugin name resolution (pslist → windows.pslist.PsList)
+- ✨ Auto-analyze on first plugin call
+- ✨ Simplified args parameter (replaces pid/params)
+- 🔧 Removed memory_dump_process tool
+- 🔧 Improved error handling and logging
 
 ## License
 

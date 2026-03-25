@@ -4,13 +4,13 @@ import os
 import platform
 from pathlib import Path
 
-__version__ = "0.1.17"
+__version__ = "0.1.19"
 
 # Response size limits
 MAX_RESPONSE_SIZE = 40000
 
 # Timeouts
-PLUGIN_TIMEOUT = 300
+PLUGIN_TIMEOUT = 400
 MEMOXIDE_CALL_TIMEOUT = 60
 
 # Paths

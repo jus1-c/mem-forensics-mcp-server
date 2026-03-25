@@ -21,6 +21,7 @@ from . import __version__
 from .config import RUST_PLUGINS, MAX_RESPONSE_SIZE
 from .core import get_session, list_sessions, clear_sessions
 from .core.vol3_cli import run_vol3_cli, list_vol3_plugins
+from .core.cache import get_cache, clear_cache
 from .engine import MemoxideClient
 
 # Plugin name mapping cache (populated from vol --help)
@@ -317,6 +318,12 @@ async def _handle_analyze_image(arguments: dict) -> list[TextContent]:
 
     session = get_session(image_path)
 
+    # Clear plugin cache for this image when re-analyzing
+    cache = get_cache()
+    cleared = cache.invalidate(image_path)
+    if cleared > 0:
+        logger.info(f"Cleared {cleared} cached results for image: {image_path}")
+
     # Try Rust first (Windows only)
     memoxide = await _get_memoxide_started()
     if memoxide.binary_available:
@@ -511,6 +518,25 @@ async def _handle_run_plugin(arguments: dict) -> list[TextContent]:
     )
     logger.info(f"Plugin in RUST_PLUGINS={plugin_lower in RUST_PLUGINS}")
 
+    # Check cache first
+    cache = get_cache()
+    cached_result = cache.get(image_path, plugin, args)
+    cache_stats = cache.stats()
+    logger.info(
+        f"Cache stats: {cache_stats['total_entries']} entries (max={cache_stats['max_size']})"
+    )
+
+    if cached_result is not None:
+        result_count = len(cached_result.get("results", []))
+        logger.info(f"Cache HIT for '{plugin}' - returning {result_count} cached results instantly")
+        cached_result["_cached"] = True
+        cached_result["_cache_stats"] = cache_stats
+        if result_filter and "results" in cached_result:
+            cached_result = _apply_filter(cached_result, result_filter)
+        return json_response(cached_result)
+    else:
+        logger.info(f"Cache MISS for '{plugin}' - computing fresh result...")
+
     # Auto-analyze if no rust session but Rust engine available
     if plugin_lower in RUST_PLUGINS and not session.rust_available:
         logger.info(f"No Rust session, auto-analyzing image...")
@@ -542,13 +568,19 @@ async def _handle_run_plugin(arguments: dict) -> list[TextContent]:
             logger.info(f"Rust result: {result}")
 
             if result and "error" not in result:
-                logger.info(f"Rust plugin succeeded")
+                result_count = len(result.get("results", []))
+                logger.info(f"Rust plugin succeeded with {result_count} results")
                 result["engine"] = "rust"
                 result["plugin_requested"] = plugin
                 result["plugin_resolved"] = full_plugin_name
                 result["note"] = f"Executed by Rust engine. Vol3 equivalent: {full_plugin_name}"
                 if result_filter:
                     result = _apply_filter(result, result_filter)
+                # Cache the result
+                cache.set(image_path, plugin, args, result)
+                logger.info(
+                    f"Cached {result_count} results for '{plugin}' (cache now has {cache.stats()['valid_entries']} entries)"
+                )
                 return json_response(result)
             else:
                 logger.warning(f"Rust plugin failed: {result}")
@@ -563,6 +595,9 @@ async def _handle_run_plugin(arguments: dict) -> list[TextContent]:
     logger.info(f"Vol3 plugin: {full_plugin_name}, args: {args}")
     vol3_result = await run_vol3_cli(image_path, full_plugin_name, args=args)
 
+    result_count = len(vol3_result.get("results", []))
+    logger.info(f"Vol3 returned {result_count} results for '{plugin}'")
+
     # Add engine info
     vol3_result["engine"] = "vol3"
     vol3_result["plugin_requested"] = plugin
@@ -571,6 +606,15 @@ async def _handle_run_plugin(arguments: dict) -> list[TextContent]:
 
     if result_filter and "results" in vol3_result:
         vol3_result = _apply_filter(vol3_result, result_filter)
+
+    # Cache the result (only if no error)
+    if "error" not in vol3_result:
+        cache.set(image_path, plugin, args, vol3_result)
+        logger.info(
+            f"Cached {result_count} results for '{plugin}' (cache now has {cache.stats()['valid_entries']} entries)"
+        )
+    else:
+        logger.warning(f"Not caching due to error: {vol3_result.get('error', 'unknown')}")
 
     return json_response(vol3_result)
 

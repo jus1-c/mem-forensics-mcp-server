@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "mem-forensics": {
+      "type": "local",
+      "command": ["python", "-m", "mem_forensics_mcp_server"],
+      "enabled": true,
+      "timeout": 10000
+    }
+  }
+}
