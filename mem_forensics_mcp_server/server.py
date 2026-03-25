@@ -5,7 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+import os
+import sys
+from typing import Any, Optional
+
+# Windows: use ProactorEventLoop for better subprocess performance
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -17,21 +23,108 @@ from .core import get_session, list_sessions, clear_sessions
 from .core.vol3_cli import run_vol3_cli, list_vol3_plugins
 from .engine import MemoxideClient
 
+# Plugin name mapping cache (populated from vol --help)
+# Structure: {"windows": {"pslist": "windows.pslist.PsList"}, "linux": {...}}
+_plugin_name_cache: dict[str, dict[str, str]] = {}
+
+
+def _build_plugin_mapping() -> dict[str, str]:
+    """Build mapping from short names to full names using cached plugin list."""
+    global _plugin_name_cache
+
+    if _plugin_name_cache:
+        return _plugin_name_cache
+
+    # We need to get plugin list - but this is async
+    # For now, return basic patterns
+    return {}
+
+
+def _resolve_plugin_name_sync(plugin: str, os_type: str) -> str:
+    """Convert short plugin name to full Vol3 name using cache."""
+    # If already full name, return as-is
+    if "." in plugin:
+        return plugin
+
+    plugin_lower = plugin.lower()
+    os_lower = os_type.lower()
+
+    # Try cache for specific OS first
+    if os_lower in _plugin_name_cache and plugin_lower in _plugin_name_cache[os_lower]:
+        return _plugin_name_cache[os_lower][plugin_lower]
+
+    # Try any OS as fallback (prefer windows)
+    for os_key in ["windows", "linux", "mac"]:
+        if os_key in _plugin_name_cache and plugin_lower in _plugin_name_cache[os_key]:
+            logger.warning(
+                f"Plugin '{plugin}' not found for OS '{os_type}', using '{os_key}' instead"
+            )
+            return _plugin_name_cache[os_key][plugin_lower]
+
+    # Fallback: simple capitalize
+    logger.warning(f"Plugin '{plugin}' not in cache for any OS, using auto-capitalize")
+    parts = plugin_lower.split("_")
+    class_name = "".join(p.capitalize() for p in parts)
+    full_name = f"{os_lower}.{plugin_lower}.{class_name}"
+    return full_name
+
+
+def _update_plugin_cache(plugins: dict[str, list]) -> None:
+    """Update cache from parsed plugin list."""
+    global _plugin_name_cache
+
+    for os_type, plugin_list in plugins.items():
+        os_lower = os_type.lower()
+        if os_lower not in _plugin_name_cache:
+            _plugin_name_cache[os_lower] = {}
+
+        for plugin in plugin_list:
+            # plugin is like "pslist" or "pslist.PsList"
+            if "." in plugin:
+                # Full format: pslist.PsList -> extract short name
+                short_name = plugin.split(".")[0].lower()
+                full_name = f"{os_type}.{plugin}"
+            else:
+                # Short format: pslist
+                short_name = plugin.lower()
+                # Capitalize: pslist -> PsList
+                class_name = "".join(p.capitalize() for p in short_name.split("_"))
+                full_name = f"{os_type}.{short_name}.{class_name}"
+
+            _plugin_name_cache[os_lower][short_name] = full_name
+
+
+import os
+
+# Setup logging to file for debugging
+log_file = os.path.join(os.path.expanduser("~"), "mem-forensics-mcp.log")
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler(log_file, mode="a"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+logger.info(f"Logging to: {log_file}")
 
 server = Server("mem-forensics-mcp-server")
 _memoxide: MemoxideClient | None = None
 
 
-def _get_memoxide() -> MemoxideClient:
-    """Get or create MemoxideClient."""
+async def _get_memoxide_started() -> Optional[MemoxideClient]:
+    """Get MemoxideClient and ensure it's started."""
     global _memoxide
     if _memoxide is None:
         _memoxide = MemoxideClient()
+
+    # Start if not already running
+    if not _memoxide.is_available():
+        started = await _memoxide.start()
+        if started:
+            logger.info("Rust engine started successfully")
+        else:
+            logger.warning("Failed to start Rust engine")
+            return None
+
     return _memoxide
 
 
@@ -104,18 +197,35 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="memory_run_plugin",
-            description="Run a forensics plugin. Auto-routes to Rust (fast) or Vol3 (fallback).",
+            description="""Run a forensics plugin. Auto-routes to Rust (fast) or Vol3 (fallback).
+
+IMPORTANT: Use 'args' parameter to pass plugin arguments. DO NOT use 'pid' parameter directly.
+
+Examples:
+- List all processes: args=['-r', 'json']
+- Dlllist for specific PID: args=['--pid', '3692', '-r', 'json']
+- Pslist with filter: args=['-r', 'json'], filter='svchost'
+- Filescan: args=['-r', 'json']
+
+The 'args' array is passed directly to Volatility3 CLI after the plugin name.
+""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "image_path": {"type": "string"},
                     "plugin": {
                         "type": "string",
-                        "description": "Plugin name (e.g., pslist, filescan)",
+                        "description": "Plugin name (e.g., pslist, filescan or full format like windows.pslist.PsList)",
                     },
-                    "pid": {"type": "integer"},
-                    "params": {"type": "object"},
-                    "filter": {"type": "string", "description": "Server-side filter"},
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "REQUIRED: List of command arguments. Must include '-r', 'json' for JSON output. Use ['--pid', 'PID_NUMBER'] for specific process.",
+                    },
+                    "filter": {
+                        "type": "string",
+                        "description": "Optional: Server-side filter to search results",
+                    },
                 },
                 "required": ["image_path", "plugin"],
             },
@@ -142,27 +252,32 @@ async def list_tools() -> list[Tool]:
         # Extraction
         Tool(
             name="memory_list_dumpable_files",
-            description="List files that can be extracted from memory cache.",
+            description="List files found in memory (scans for FILE_OBJECTs using filescan plugin). Use this BEFORE dumping to see what files are available.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "image_path": {"type": "string"},
-                    "pid": {"type": "integer"},
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional args like ['-r', 'json', '--pid', '1234']",
+                    },
                 },
                 "required": ["image_path"],
             },
         ),
         Tool(
-            name="memory_dump_process",
-            description="Dump a process from memory.",
+            name="memory_get_tool_help",
+            description="Get detailed help and examples for any tool. Use this to see correct usage and parameters.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "image_path": {"type": "string"},
-                    "pid": {"type": "integer"},
-                    "output_dir": {"type": "string"},
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Name of tool to get help for (e.g., memory_run_plugin, memory_analyze_image)",
+                    }
                 },
-                "required": ["image_path", "pid"],
+                "required": ["tool_name"],
             },
         ),
     ]
@@ -186,8 +301,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             return _handle_get_status()
         elif name == "memory_list_dumpable_files":
             return await _handle_list_dumpable_files(arguments)
-        elif name == "memory_dump_process":
-            return await _handle_dump_process(arguments)
+        elif name == "memory_get_tool_help":
+            return await _handle_get_tool_help(arguments)
         else:
             return json_response({"error": f"Unknown tool: {name}"})
 
@@ -203,7 +318,7 @@ async def _handle_analyze_image(arguments: dict) -> list[TextContent]:
     session = get_session(image_path)
 
     # Try Rust first (Windows only)
-    memoxide = _get_memoxide()
+    memoxide = await _get_memoxide_started()
     if memoxide.binary_available:
         rust_result = await memoxide.analyze_image(
             image_path,
@@ -377,32 +492,82 @@ async def _handle_run_plugin(arguments: dict) -> list[TextContent]:
     image_path = arguments["image_path"]
     plugin = arguments["plugin"]  # Keep original case for Vol3
     plugin_lower = plugin.lower()  # Lowercase for Rust check
-    pid = arguments.get("pid")
-    params = arguments.get("params", {})
+    args = arguments.get("args", [])  # List of arguments for Vol3 ONLY
     result_filter = arguments.get("filter")
 
     session = get_session(image_path)
 
+    # Resolve plugin name to full format
+    # Ensure profile is a dict before calling .get()
+    profile = session.profile if isinstance(session.profile, dict) else {}
+    os_type = profile.get("os", "windows").lower() if profile else "windows"
+    full_plugin_name = _resolve_plugin_name_sync(plugin, os_type)
+
+    logger.info(f"Resolved plugin: {plugin} -> {full_plugin_name}")
+
+    logger.info(f"Plugin '{plugin}' resolved to '{full_plugin_name}', OS={os_type}")
+    logger.info(
+        f"Session rust_available={session.rust_available}, rust_session_id={session.rust_session_id}"
+    )
+    logger.info(f"Plugin in RUST_PLUGINS={plugin_lower in RUST_PLUGINS}")
+
+    # Auto-analyze if no rust session but Rust engine available
+    if plugin_lower in RUST_PLUGINS and not session.rust_available:
+        logger.info(f"No Rust session, auto-analyzing image...")
+        memoxide = await _get_memoxide_started()
+        if memoxide and memoxide.is_available():
+            rust_result = await memoxide.analyze_image(image_path)
+            if rust_result and "session_id" in rust_result:
+                session.rust_session_id = rust_result.get("session_id")
+                logger.info(f"Auto-analysis successful, rust_session_id={session.rust_session_id}")
+            else:
+                logger.warning(f"Auto-analysis failed: {rust_result}")
+
     # Try Rust for supported plugins (case-insensitive check)
     if plugin_lower in RUST_PLUGINS and session.rust_available:
-        memoxide = _get_memoxide()
-        if memoxide.is_available():
-            rust_params = dict(params)
-            if pid is not None:
-                rust_params["pid"] = pid
+        logger.info(f"Attempting Rust engine for plugin '{plugin}'")
+        memoxide = await _get_memoxide_started()
+        if memoxide and memoxide.is_available():
+            logger.info(f"Rust engine available, running plugin...")
+            # Parse pid from args for Rust if present (but don't pass args to Rust)
+            rust_params = {}
+            for i, arg in enumerate(args):
+                if arg == "--pid" and i + 1 < len(args):
+                    rust_params["pid"] = int(args[i + 1])
 
             result = await memoxide.run_plugin(
                 session.rust_session_id, plugin_lower, rust_params if rust_params else None
             )
 
+            logger.info(f"Rust result: {result}")
+
             if result and "error" not in result:
+                logger.info(f"Rust plugin succeeded")
                 result["engine"] = "rust"
+                result["plugin_requested"] = plugin
+                result["plugin_resolved"] = full_plugin_name
+                result["note"] = f"Executed by Rust engine. Vol3 equivalent: {full_plugin_name}"
                 if result_filter:
                     result = _apply_filter(result, result_filter)
                 return json_response(result)
+            else:
+                logger.warning(f"Rust plugin failed: {result}")
+        else:
+            logger.warning(f"Rust engine not available")
+    else:
+        logger.info(
+            f"Skipping Rust: plugin_supported={plugin_lower in RUST_PLUGINS}, rust_available={session.rust_available}"
+        )
 
-    # Fallback to Vol3
-    vol3_result = await run_vol3_cli(image_path, plugin, pid=pid, **params)
+    # Fallback to Vol3 with resolved name and args
+    logger.info(f"Vol3 plugin: {full_plugin_name}, args: {args}")
+    vol3_result = await run_vol3_cli(image_path, full_plugin_name, args=args)
+
+    # Add engine info
+    vol3_result["engine"] = "vol3"
+    vol3_result["plugin_requested"] = plugin
+    vol3_result["plugin_resolved"] = full_plugin_name
+    vol3_result["note"] = "Executed by Volatility3 engine"
 
     if result_filter and "results" in vol3_result:
         vol3_result = _apply_filter(vol3_result, result_filter)
@@ -414,6 +579,11 @@ async def _handle_list_plugins(arguments: dict) -> list[TextContent]:
     """Handle memory_list_plugins - list available plugins from both engines."""
     # Get Vol3 plugins dynamically
     vol3_plugins = await list_vol3_plugins()
+
+    # Update cache with parsed plugins for auto-resolve
+    if "error" not in vol3_plugins and "plugins" in vol3_plugins:
+        _update_plugin_cache(vol3_plugins["plugins"])
+        logger.info(f"Updated plugin cache with {vol3_plugins.get('count', 0)} plugins")
 
     return json_response(
         {
@@ -444,13 +614,17 @@ def _handle_list_sessions() -> list[TextContent]:
 
 def _handle_get_status() -> list[TextContent]:
     """Handle memory_get_status."""
-    memoxide = _get_memoxide()
+    # Use sync check for status
+    global _memoxide
+    binary_available = False
+    if _memoxide is not None:
+        binary_available = _memoxide.binary_available
 
     return json_response(
         {
             "rust_engine": {
-                "binary_available": memoxide.binary_available,
-                "running": memoxide.is_available(),
+                "binary_available": binary_available,
+                "running": _memoxide.is_available() if _memoxide else False,
                 "supported_plugins": sorted(RUST_PLUGINS),
             },
             "volatility3": {
@@ -463,42 +637,135 @@ def _handle_get_status() -> list[TextContent]:
 
 
 async def _handle_list_dumpable_files(arguments: dict) -> list[TextContent]:
-    """Handle memory_list_dumpable_files."""
+    """Handle memory_list_dumpable_files - List files in memory (not dump)."""
     image_path = arguments["image_path"]
-    pid = arguments.get("pid")
+    args = arguments.get("args", [])
 
-    # This requires Vol3 dumpfiles plugin
+    # Use filescan to list files, NOT dumpfiles
     result = await run_vol3_cli(
         image_path,
-        "windows.dumpfiles.DumpFiles",
-        pid=pid,
+        "windows.filescan.FileScan",
+        args=args,
     )
 
     return json_response(result)
 
 
-async def _handle_dump_process(arguments: dict) -> list[TextContent]:
-    """Handle memory_dump_process."""
-    image_path = arguments["image_path"]
-    pid = arguments["pid"]
-    output_dir = arguments.get("output_dir", "/tmp/memdumps")
+async def _handle_get_tool_help(arguments: dict) -> list[TextContent]:
+    """Handle memory_get_tool_help - return detailed help for a tool."""
+    tool_name = arguments["tool_name"]
 
-    result = await run_vol3_cli(
-        image_path,
-        "windows.memmap.Memmap",
-        pid=pid,
-        dump_dir=output_dir,
-    )
+    tool_help = {
+        "memory_run_plugin": {
+            "description": "Run a forensics plugin. Auto-routes to Rust (fast) or Vol3 (fallback).",
+            "important_notes": [
+                "Use 'args' parameter to pass plugin arguments",
+                "DO NOT use 'pid' parameter directly - include it in 'args'",
+                "Always include '-r', 'json' in args for JSON output",
+                "Check 'engine' in response: 'rust' (fast) or 'vol3' (fallback)",
+                "Check 'plugin_resolved' to see full plugin name used",
+            ],
+            "examples": [
+                {
+                    "description": "List all processes",
+                    "call": {"plugin": "pslist", "args": ["-r", "json"]},
+                },
+                {
+                    "description": "Dlllist for specific PID",
+                    "call": {"plugin": "dlllist", "args": ["--pid", "3692", "-r", "json"]},
+                },
+                {
+                    "description": "Pslist with server-side filter",
+                    "call": {"plugin": "pslist", "args": ["-r", "json"], "filter": "svchost"},
+                },
+                {
+                    "description": "Filescan (large output, will be truncated)",
+                    "call": {"plugin": "filescan", "args": ["-r", "json"]},
+                },
+            ],
+            "common_args": [
+                "-r json: Output in JSON format (REQUIRED)",
+                "--pid PID: Filter by process ID",
+                "--offset OFFSET: Filter by physical offset",
+                "--dump: Enable dumping for plugins that support it",
+            ],
+            "response_fields": {
+                "engine": "Which engine executed: 'rust' (fast) or 'vol3' (fallback)",
+                "plugin_requested": "The plugin name you requested",
+                "plugin_resolved": "Full plugin name (e.g., windows.pslist.PsList)",
+                "note": "Additional info about execution",
+            },
+        },
+        "memory_analyze_image": {
+            "description": "Initialize memory image analysis. Detects OS profile and creates session.",
+            "example": {"image_path": "E:\\CTF\\memory.dmp"},
+            "notes": [
+                "Must call this first before using other tools",
+                "Auto-detects Windows/Linux/Mac",
+            ],
+        },
+        "memory_list_plugins": {
+            "description": "List all available plugins from both Rust and Vol3 engines.",
+            "example": {"image_path": "E:\\CTF\\memory.dmp"},
+        },
+        "memory_list_sessions": {
+            "description": "List all active analysis sessions.",
+            "example": {},
+        },
+        "memory_get_status": {
+            "description": "Get server status and check engine availability.",
+            "example": {},
+        },
+        "memory_list_dumpable_files": {
+            "description": "List files found in memory (scans for FILE_OBJECTs). Use this to find files before dumping.",
+            "example": {"image_path": "E:\\CTF\\memory.dmp", "args": ["-r", "json"]},
+            "note": "This runs windows.filescan.FileScan plugin, NOT dumpfiles",
+        },
+        "memory_get_tool_help": {
+            "description": "Get this help message for any tool.",
+            "example": {"tool_name": "memory_run_plugin"},
+        },
+    }
 
-    return json_response(result)
+    if tool_name in tool_help:
+        return json_response(
+            {
+                "tool": tool_name,
+                "help": tool_help[tool_name],
+                "note": "Use 'args' array for all plugin arguments. See examples above.",
+            }
+        )
+    else:
+        available = list(tool_help.keys())
+        return json_response(
+            {
+                "error": f"Unknown tool: {tool_name}",
+                "available_tools": available,
+                "suggestion": f"Choose from: {', '.join(available)}",
+            }
+        )
 
 
 async def main():
     """Run the MCP server."""
     logger.info(f"Starting mem-forensics-mcp-server v{__version__}")
 
-    memoxide = _get_memoxide()
+    memoxide = await _get_memoxide_started()
     logger.info(f"Rust engine: {'available' if memoxide.binary_available else 'not found'}")
+
+    # Populate plugin cache at startup
+    try:
+        logger.info("Populating plugin cache from Vol3...")
+        vol3_plugins = await list_vol3_plugins()
+        if "error" not in vol3_plugins and "plugins" in vol3_plugins:
+            _update_plugin_cache(vol3_plugins["plugins"])
+            logger.info(f"Plugin cache populated with {len(_plugin_name_cache)} plugins")
+        else:
+            logger.warning(
+                f"Could not populate plugin cache: {vol3_plugins.get('error', 'unknown error')}"
+            )
+    except Exception as e:
+        logger.warning(f"Failed to populate plugin cache: {e}")
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(

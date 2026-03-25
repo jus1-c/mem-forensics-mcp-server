@@ -4,7 +4,7 @@ import os
 import platform
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.1.17"
 
 # Response size limits
 MAX_RESPONSE_SIZE = 40000
