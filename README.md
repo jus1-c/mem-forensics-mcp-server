@@ -53,7 +53,7 @@ vol --version
 
 **From Source:**
 ```bash
-git clone https://github.com/yourusername/mem-forensics-mcp-server.git
+git clone https://github.com/jus1-c/mem-forensics-mcp-server.git
 cd mem-forensics-mcp-server
 pip install -e .
 ```
