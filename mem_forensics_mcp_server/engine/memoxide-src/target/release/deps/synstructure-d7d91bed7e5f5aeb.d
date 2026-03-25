@@ -1,0 +1,8 @@
+C:\Users\Administrator\Documents\Python\Forensics_Tools\mem-forensics-mcp-server\mem-forrensics-mcp-server\mem_forensics_mcp_server\engine\memoxide-src\target\release\deps\synstructure-d7d91bed7e5f5aeb.d: C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\synstructure-0.13.2\src\lib.rs C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\synstructure-0.13.2\src\macros.rs
+
+C:\Users\Administrator\Documents\Python\Forensics_Tools\mem-forensics-mcp-server\mem-forrensics-mcp-server\mem_forensics_mcp_server\engine\memoxide-src\target\release\deps\libsynstructure-d7d91bed7e5f5aeb.rlib: C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\synstructure-0.13.2\src\lib.rs C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\synstructure-0.13.2\src\macros.rs
+
+C:\Users\Administrator\Documents\Python\Forensics_Tools\mem-forensics-mcp-server\mem-forrensics-mcp-server\mem_forensics_mcp_server\engine\memoxide-src\target\release\deps\libsynstructure-d7d91bed7e5f5aeb.rmeta: C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\synstructure-0.13.2\src\lib.rs C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\synstructure-0.13.2\src\macros.rs
+
+C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\synstructure-0.13.2\src\lib.rs:
+C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\synstructure-0.13.2\src\macros.rs:

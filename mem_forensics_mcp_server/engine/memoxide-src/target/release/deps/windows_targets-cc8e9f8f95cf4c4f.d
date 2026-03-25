@@ -1,0 +1,8 @@
+C:\Users\Administrator\Documents\Python\Forensics_Tools\mem-forensics-mcp-server\mem-forrensics-mcp-server\mem_forensics_mcp_server\engine\memoxide-src\target\release\deps\windows_targets-cc8e9f8f95cf4c4f.d: C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-targets-0.53.5\src\lib.rs C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-targets-0.53.5\src\../readme.md
+
+C:\Users\Administrator\Documents\Python\Forensics_Tools\mem-forensics-mcp-server\mem-forrensics-mcp-server\mem_forensics_mcp_server\engine\memoxide-src\target\release\deps\libwindows_targets-cc8e9f8f95cf4c4f.rlib: C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-targets-0.53.5\src\lib.rs C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-targets-0.53.5\src\../readme.md
+
+C:\Users\Administrator\Documents\Python\Forensics_Tools\mem-forensics-mcp-server\mem-forrensics-mcp-server\mem_forensics_mcp_server\engine\memoxide-src\target\release\deps\libwindows_targets-cc8e9f8f95cf4c4f.rmeta: C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-targets-0.53.5\src\lib.rs C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-targets-0.53.5\src\../readme.md
+
+C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-targets-0.53.5\src\lib.rs:
+C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-targets-0.53.5\src\../readme.md:

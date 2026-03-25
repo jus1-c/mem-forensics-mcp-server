@@ -1,0 +1,8 @@
+C:\Users\Administrator\Documents\Python\Forensics_Tools\mem-forensics-mcp-server\mem-forrensics-mcp-server\mem_forensics_mcp_server\engine\memoxide-src\target\release\deps\memmap2-80e5ed43adc4b673.d: C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\memmap2-0.9.9\src\lib.rs C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\memmap2-0.9.9\src\windows.rs
+
+C:\Users\Administrator\Documents\Python\Forensics_Tools\mem-forensics-mcp-server\mem-forrensics-mcp-server\mem_forensics_mcp_server\engine\memoxide-src\target\release\deps\libmemmap2-80e5ed43adc4b673.rlib: C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\memmap2-0.9.9\src\lib.rs C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\memmap2-0.9.9\src\windows.rs
+
+C:\Users\Administrator\Documents\Python\Forensics_Tools\mem-forensics-mcp-server\mem-forrensics-mcp-server\mem_forensics_mcp_server\engine\memoxide-src\target\release\deps\libmemmap2-80e5ed43adc4b673.rmeta: C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\memmap2-0.9.9\src\lib.rs C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\memmap2-0.9.9\src\windows.rs
+
+C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\memmap2-0.9.9\src\lib.rs:
+C:\Users\Administrator\scoop\persist\rustup\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\memmap2-0.9.9\src\windows.rs:
