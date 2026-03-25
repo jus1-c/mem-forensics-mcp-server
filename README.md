@@ -51,11 +51,6 @@ vol --version
 
 ### 2. Install MCP Server
 
-**From PyPI:**
-```bash
-pip install mem-forensics-mcp-server
-```
-
 **From Source:**
 ```bash
 git clone https://github.com/yourusername/mem-forensics-mcp-server.git
