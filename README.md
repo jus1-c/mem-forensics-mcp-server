@@ -14,7 +14,7 @@ This project is based on the excellent work by [xtk](https://github.com/x746b) i
 - **Intelligent Caching**: 200-entry cache with LRU eviction (survives until server restart)
 - **Auto-Detection**: Automatic OS profile detection and plugin name resolution
 - **High Performance**: Rust native plugins for common operations (3s vs 60s)
-- **Full Coverage**: Access to 195+ Volatility3 plugins when needed
+- **Full Coverage**: Access to available Volatility3 plugins through the Volatility3 API
 - **Smart Routing**: Automatically selects fastest available engine
 - **No Pre-analysis Required**: Plugins auto-analyze image if needed
 
@@ -31,22 +31,28 @@ Tested on Windows crash dump (2GB, ~109 processes):
 ## Requirements
 
 - Python 3.10+
-- Volatility3 (2.5+) - optional, for Tier 2 fallback
+- Git CLI - used to clone/update the Volatility3 `stable` branch
 - Rust toolchain (optional, for building memoxide from source)
 - MCP-compatible client (Claude Desktop, VSCode, Cline, etc.)
 
 ## Installation
 
-### 1. Install Volatility3 (Optional)
+### 1. Configure Volatility3 Source
 
-**Via pip:**
+Volatility3 is loaded from a managed git checkout, not from the pip `volatility3` package.
+
+Create `.env` in the project root:
 ```bash
-pip install volatility3 pefile pycryptodome
+cp .env.example .env
 ```
 
-**Verify installation:**
-```bash
-vol --version
+Default `.env`:
+```env
+VOLATILITY3_REPO_URL=https://github.com/volatilityfoundation/volatility3
+VOLATILITY3_BRANCH=stable
+VOLATILITY3_REPO_PATH=.cache/volatility3
+VOLATILITY3_AUTO_UPDATE=true
+VOLATILITY3_UPDATE_INTERVAL_SECONDS=86400
 ```
 
 ### 2. Install MCP Server
@@ -60,6 +66,8 @@ pip install -e .
 
 ## Configuration
 
+Logs are written to `mem-forensics-mcp.log` in the project/install root, next to `.env`.
+
 ### Claude Desktop
 
 Edit `claude_desktop_config.json`:
@@ -72,10 +80,7 @@ Edit `claude_desktop_config.json`:
   "mcpServers": {
     "mem-forensics": {
       "command": "python",
-      "args": ["-m", "mem_forensics_mcp_server"],
-      "env": {
-        "VOLATILITY3_PATH": ""
-      }
+      "args": ["-m", "mem_forensics_mcp_server"]
     }
   }
 }
@@ -124,12 +129,13 @@ Run a forensics plugin. Auto-routes to Rust (fast) or Vol3 (fallback).
 **Parameters:**
 - `image_path`: Absolute path to memory dump (required)
 - `plugin`: Plugin name - can be short ("pslist") or full ("windows.pslist.PsList")
-- `args`: List of arguments (optional, e.g., ["--pid", "1234", "-r", "json"])
+- `args`: List of plugin arguments (optional, e.g., ["--pid", "1234"])
 - `filter`: Server-side filter string (optional)
 
 **Important Notes:**
 - Use `args` parameter for all plugin arguments
-- Include `-r json` for JSON output (auto-added if not specified)
+- Output is always JSON-rendered through the Volatility3 API
+- `-r json` is accepted but ignored for backward compatibility
 - Short plugin names are auto-resolved to full format
 
 **Examples:**
@@ -171,7 +177,7 @@ List all available plugins from both engines.
 
 **Returns:**
 - 9 Rust plugins (fast)
-- 195 Vol3 plugins (Windows/Linux/Mac/Other)
+- Vol3 plugins discovered from the managed `stable` checkout (Windows/Linux/Mac/Other)
 
 ### 4. memory_list_sessions
 
@@ -269,15 +275,19 @@ The server includes an intelligent caching system:
 
 - **Path Validation**: Only absolute paths allowed
 - **Engine Isolation**: Rust plugins run in separate subprocess
-- **Timeout Protection**: 60s timeout for Rust, 300s for Vol3
+- **Timeout Protection**: 60s timeout for Rust engine calls
 - **Size Limits**: Configurable response size limits
 - **No Secrets**: No logging of sensitive memory contents
 
-## Environment Variables
+## .env Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `VOLATILITY3_PATH` | Path to Volatility3 installation | auto-detect |
+| `VOLATILITY3_REPO_URL` | Volatility3 git repository URL | `https://github.com/volatilityfoundation/volatility3` |
+| `VOLATILITY3_BRANCH` | Volatility3 branch to use | `stable` |
+| `VOLATILITY3_REPO_PATH` | Local checkout path, relative to project root if not absolute | `.cache/volatility3` |
+| `VOLATILITY3_AUTO_UPDATE` | Auto-update checkout on startup when due | `true` |
+| `VOLATILITY3_UPDATE_INTERVAL_SECONDS` | Auto-update interval | `86400` |
 
 ## Architecture
 
@@ -293,7 +303,7 @@ The server includes an intelligent caching system:
                                ▼
                         ┌─────────────┐     ┌─────────────┐
                         │    Cache    │────▶│  Volatility3│
-                        │  (200 entries│     │  (Fallback) │
+                        │ (200 entries)│     │ API Fallback│
                         └─────────────┘     └─────────────┘
 ```
 
@@ -309,7 +319,10 @@ mem-forensics-mcp-server/
 │   ├── core/
 │   │   ├── session.py           # Session management
 │   │   ├── cache.py             # Plugin result caching
-│   │   └── vol3_cli.py          # Vol3 CLI wrapper
+│   │   ├── settings.py          # .env settings loader
+│   │   ├── vol3_repo.py         # Managed Volatility3 git checkout
+│   │   ├── vol3_api.py          # Vol3 API backend
+│   │   └── vol3_cli.py          # Compatibility shim
 │   ├── engine/
 │   │   ├── memoxide_client.py   # Rust engine client
 │   │   └── memoxide/            # Prebuilt binaries
@@ -318,6 +331,7 @@ mem-forensics-mcp-server/
 │   └── utils/
 │       └── helpers.py
 ├── pyproject.toml
+├── .env.example
 ├── README.md
 └── .gitignore
 ```
@@ -362,16 +376,17 @@ Some memory dump formats may not be compatible with certain plugins. Error messa
 
 Rust engine has 60s timeout. For very large dumps, Vol3 fallback will be used automatically.
 
-### Plugin returns "usage: vol.EXE..."
+### Plugin argument errors
 
-This means the arguments passed are incorrect. Check the plugin's help:
-```
-vol <plugin_name> --help
-```
+This means the arguments passed do not match the plugin's Volatility3 requirements.
+Use `memory_get_tool_help` for MCP examples or call `memory_list_plugins` to verify the
+resolved plugin name.
 
 ## Recent Updates
 
 ### v0.1.19
+- Added Volatility3 API backend from managed git `stable` checkout
+- Added `.env`-only Volatility3 configuration and auto-update settings
 - ✨ Added intelligent caching system (200 entries)
 - ✨ Auto-plugin name resolution (pslist → windows.pslist.PsList)
 - ✨ Auto-analyze on first plugin call

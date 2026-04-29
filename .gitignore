@@ -46,6 +46,8 @@ file.*.dat
 file.*.vacb
 symbols/
 /tmp/
+.cache/
+.env
 
 # Test outputs
 test_*.py

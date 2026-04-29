@@ -1,6 +1,5 @@
 """Configuration settings for mem-forensics-mcp-server."""
 
-import os
 import platform
 from pathlib import Path
 
@@ -28,9 +27,6 @@ _is_windows = platform.system() == "Windows"
 _memoxide_name = "memoxide.exe" if _is_windows else "memoxide"
 MEMOXIDE_BINARY = _PACKAGE_DIR / "engine" / "memoxide" / _ARCH / _memoxide_name
 MEMOXIDE_SRC_DIR = _PACKAGE_DIR / "engine" / "memoxide-src"
-
-# Volatility3 settings
-VOLATILITY3_PATH = os.environ.get("VOLATILITY3_PATH", "")
 
 # Plugins supported by Rust engine (from memoxide source)
 RUST_PLUGINS = {

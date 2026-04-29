@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import sys
 from typing import Any, Optional
 
@@ -18,13 +17,14 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from . import __version__
-from .config import RUST_PLUGINS, MAX_RESPONSE_SIZE
-from .core import get_session, list_sessions, clear_sessions
-from .core.vol3_cli import run_vol3_cli, list_vol3_plugins
-from .core.cache import get_cache, clear_cache
+from .config import MAX_RESPONSE_SIZE, RUST_PLUGINS
+from .core import get_session, list_sessions
+from .core.cache import get_cache
+from .core.settings import PROJECT_ROOT
+from .core.vol3_api import get_vol3_status, list_vol3_plugins, run_vol3_api
 from .engine import MemoxideClient
 
-# Plugin name mapping cache (populated from vol --help)
+# Plugin name mapping cache (populated from the Volatility3 API)
 # Structure: {"windows": {"pslist": "windows.pslist.PsList"}, "linux": {...}}
 _plugin_name_cache: dict[str, dict[str, str]] = {}
 
@@ -95,10 +95,9 @@ def _update_plugin_cache(plugins: dict[str, list]) -> None:
             _plugin_name_cache[os_lower][short_name] = full_name
 
 
-import os
 
 # Setup logging to file for debugging
-log_file = os.path.join(os.path.expanduser("~"), "mem-forensics-mcp.log")
+log_file = PROJECT_ROOT / "mem-forensics-mcp.log"
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -172,6 +171,34 @@ def _apply_filter(data: dict[str, Any], filter_str: str) -> dict[str, Any]:
     return data
 
 
+def _normalize_results(data: dict[str, Any], plugin: str) -> dict[str, Any]:
+    """Expose plugin-specific Rust result rows through the common results key."""
+    if "results" in data:
+        return data
+
+    primary_keys = {
+        "pslist": "processes",
+        "psscan": "processes",
+        "cmdline": "cmdlines",
+        "dlllist": "dlls",
+        "cmdscan": "commands",
+        "malfind": "findings",
+        "netscan": "connections",
+        "search": "matches",
+        "memsearch": "matches",
+    }
+    key = primary_keys.get(plugin.lower())
+    if key and isinstance(data.get(key), list):
+        data["results"] = data[key]
+        return data
+
+    for value in data.values():
+        if isinstance(value, list):
+            data["results"] = value
+            break
+    return data
+
+
 def json_response(data: dict[str, Any]) -> list[TextContent]:
     """Create JSON response."""
     data = truncate_response(data)
@@ -203,12 +230,13 @@ async def list_tools() -> list[Tool]:
 IMPORTANT: Use 'args' parameter to pass plugin arguments. DO NOT use 'pid' parameter directly.
 
 Examples:
-- List all processes: args=['-r', 'json']
-- Dlllist for specific PID: args=['--pid', '3692', '-r', 'json']
-- Pslist with filter: args=['-r', 'json'], filter='svchost'
-- Filescan: args=['-r', 'json']
+- List all processes: args=[]
+- Dlllist for specific PID: args=['--pid', '3692']
+- Pslist with filter: args=[], filter='svchost'
+- Filescan: args=[]
 
-The 'args' array is passed directly to Volatility3 CLI after the plugin name.
+The 'args' array is mapped onto Volatility3 plugin requirements. '-r json' is ignored
+for backward compatibility because results are rendered through the API.
 """,
             inputSchema={
                 "type": "object",
@@ -221,7 +249,7 @@ The 'args' array is passed directly to Volatility3 CLI after the plugin name.
                     "args": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "REQUIRED: List of command arguments. Must include '-r', 'json' for JSON output. Use ['--pid', 'PID_NUMBER'] for specific process.",
+                        "description": "Optional Volatility3 plugin arguments. Use ['--pid', 'PID_NUMBER'] for specific process. '-r json' is accepted but ignored.",
                     },
                     "filter": {
                         "type": "string",
@@ -261,7 +289,7 @@ The 'args' array is passed directly to Volatility3 CLI after the plugin name.
                     "args": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional args like ['-r', 'json', '--pid', '1234']",
+                        "description": "Optional args like ['--pid', '1234']; '-r json' is ignored if provided",
                     },
                 },
                 "required": ["image_path"],
@@ -377,7 +405,7 @@ async def _handle_analyze_image(arguments: dict) -> list[TextContent]:
     logger.info("Rust detect failed, trying Vol3 banners detect...")
 
     # Try Windows info first
-    vol3_result = await run_vol3_cli(image_path, "windows.info.Info")
+    vol3_result = await run_vol3_api(image_path, "windows.info.Info")
     if "error" not in vol3_result and vol3_result.get("results"):
         profile = _extract_windows_profile(vol3_result.get("results", []))
         session.profile = profile
@@ -392,7 +420,7 @@ async def _handle_analyze_image(arguments: dict) -> list[TextContent]:
         )
 
     # Try Linux banner
-    vol3_result = await run_vol3_cli(image_path, "banners.Banners")
+    vol3_result = await run_vol3_api(image_path, "banners.Banners")
     if "error" not in vol3_result and vol3_result.get("results"):
         profile = _extract_linux_profile(vol3_result.get("results", []))
         session.profile = profile
@@ -407,7 +435,7 @@ async def _handle_analyze_image(arguments: dict) -> list[TextContent]:
         )
 
     # Try Mac banner (if supported)
-    vol3_result = await run_vol3_cli(image_path, "mac.Banner")
+    vol3_result = await run_vol3_api(image_path, "mac.Banner")
     if "error" not in vol3_result and vol3_result.get("results"):
         profile = _extract_mac_profile(vol3_result.get("results", []))
         session.profile = profile
@@ -508,6 +536,10 @@ async def _handle_run_plugin(arguments: dict) -> list[TextContent]:
     # Ensure profile is a dict before calling .get()
     profile = session.profile if isinstance(session.profile, dict) else {}
     os_type = profile.get("os", "windows").lower() if profile else "windows"
+    if "." not in plugin and not _plugin_name_cache:
+        vol3_plugins = await list_vol3_plugins()
+        if "error" not in vol3_plugins and "plugins" in vol3_plugins:
+            _update_plugin_cache(vol3_plugins["plugins"])
     full_plugin_name = _resolve_plugin_name_sync(plugin, os_type)
 
     logger.info(f"Resolved plugin: {plugin} -> {full_plugin_name}")
@@ -539,7 +571,7 @@ async def _handle_run_plugin(arguments: dict) -> list[TextContent]:
 
     # Auto-analyze if no rust session but Rust engine available
     if plugin_lower in RUST_PLUGINS and not session.rust_available:
-        logger.info(f"No Rust session, auto-analyzing image...")
+        logger.info("No Rust session, auto-analyzing image...")
         memoxide = await _get_memoxide_started()
         if memoxide and memoxide.is_available():
             rust_result = await memoxide.analyze_image(image_path)
@@ -554,7 +586,7 @@ async def _handle_run_plugin(arguments: dict) -> list[TextContent]:
         logger.info(f"Attempting Rust engine for plugin '{plugin}'")
         memoxide = await _get_memoxide_started()
         if memoxide and memoxide.is_available():
-            logger.info(f"Rust engine available, running plugin...")
+            logger.info("Rust engine available, running plugin...")
             # Parse pid from args for Rust if present (but don't pass args to Rust)
             rust_params = {}
             for i, arg in enumerate(args):
@@ -568,6 +600,7 @@ async def _handle_run_plugin(arguments: dict) -> list[TextContent]:
             logger.info(f"Rust result: {result}")
 
             if result and "error" not in result:
+                result = _normalize_results(result, plugin_lower)
                 result_count = len(result.get("results", []))
                 logger.info(f"Rust plugin succeeded with {result_count} results")
                 result["engine"] = "rust"
@@ -585,7 +618,7 @@ async def _handle_run_plugin(arguments: dict) -> list[TextContent]:
             else:
                 logger.warning(f"Rust plugin failed: {result}")
         else:
-            logger.warning(f"Rust engine not available")
+            logger.warning("Rust engine not available")
     else:
         logger.info(
             f"Skipping Rust: plugin_supported={plugin_lower in RUST_PLUGINS}, rust_available={session.rust_available}"
@@ -593,7 +626,7 @@ async def _handle_run_plugin(arguments: dict) -> list[TextContent]:
 
     # Fallback to Vol3 with resolved name and args
     logger.info(f"Vol3 plugin: {full_plugin_name}, args: {args}")
-    vol3_result = await run_vol3_cli(image_path, full_plugin_name, args=args)
+    vol3_result = await run_vol3_api(image_path, full_plugin_name, args=args)
 
     result_count = len(vol3_result.get("results", []))
     logger.info(f"Vol3 returned {result_count} results for '{plugin}'")
@@ -640,7 +673,7 @@ async def _handle_list_plugins(arguments: dict) -> list[TextContent]:
             if "error" not in vol3_plugins
             else {
                 "error": vol3_plugins.get("error"),
-                "note": "Install volatility3 to see available plugins",
+                "note": "Check .env Volatility3 git checkout settings and git availability",
             },
         }
     )
@@ -671,9 +704,7 @@ def _handle_get_status() -> list[TextContent]:
                 "running": _memoxide.is_available() if _memoxide else False,
                 "supported_plugins": sorted(RUST_PLUGINS),
             },
-            "volatility3": {
-                "available": True,  # Assume available, actual check on use
-            },
+            "volatility3": get_vol3_status(),
             "server_version": __version__,
             "architecture": "Two-tier: Rust (fast) → Vol3 (fallback)",
         }
@@ -686,7 +717,7 @@ async def _handle_list_dumpable_files(arguments: dict) -> list[TextContent]:
     args = arguments.get("args", [])
 
     # Use filescan to list files, NOT dumpfiles
-    result = await run_vol3_cli(
+    result = await run_vol3_api(
         image_path,
         "windows.filescan.FileScan",
         args=args,
@@ -705,30 +736,30 @@ async def _handle_get_tool_help(arguments: dict) -> list[TextContent]:
             "important_notes": [
                 "Use 'args' parameter to pass plugin arguments",
                 "DO NOT use 'pid' parameter directly - include it in 'args'",
-                "Always include '-r', 'json' in args for JSON output",
+                "Do not include '-r', 'json' for new calls; it is accepted but ignored for compatibility",
                 "Check 'engine' in response: 'rust' (fast) or 'vol3' (fallback)",
                 "Check 'plugin_resolved' to see full plugin name used",
             ],
             "examples": [
                 {
                     "description": "List all processes",
-                    "call": {"plugin": "pslist", "args": ["-r", "json"]},
+                    "call": {"plugin": "pslist", "args": []},
                 },
                 {
                     "description": "Dlllist for specific PID",
-                    "call": {"plugin": "dlllist", "args": ["--pid", "3692", "-r", "json"]},
+                    "call": {"plugin": "dlllist", "args": ["--pid", "3692"]},
                 },
                 {
                     "description": "Pslist with server-side filter",
-                    "call": {"plugin": "pslist", "args": ["-r", "json"], "filter": "svchost"},
+                    "call": {"plugin": "pslist", "args": [], "filter": "svchost"},
                 },
                 {
                     "description": "Filescan (large output, will be truncated)",
-                    "call": {"plugin": "filescan", "args": ["-r", "json"]},
+                    "call": {"plugin": "filescan", "args": []},
                 },
             ],
             "common_args": [
-                "-r json: Output in JSON format (REQUIRED)",
+                "-r json: accepted but ignored; output is always API-rendered JSON",
                 "--pid PID: Filter by process ID",
                 "--offset OFFSET: Filter by physical offset",
                 "--dump: Enable dumping for plugins that support it",
@@ -762,7 +793,7 @@ async def _handle_get_tool_help(arguments: dict) -> list[TextContent]:
         },
         "memory_list_dumpable_files": {
             "description": "List files found in memory (scans for FILE_OBJECTs). Use this to find files before dumping.",
-            "example": {"image_path": "E:\\CTF\\memory.dmp", "args": ["-r", "json"]},
+            "example": {"image_path": "E:\\CTF\\memory.dmp", "args": []},
             "note": "This runs windows.filescan.FileScan plugin, NOT dumpfiles",
         },
         "memory_get_tool_help": {
