@@ -78,8 +78,9 @@ def test_curated_parameters_match_plugin_requirements() -> None:
     assert _curated_params(
         "memory_list_network_connections", {"os": "linux", "pid": 12}
     ) == {"pids": [12]}
-    with pytest.raises(ValueError, match="NetScan"):
-        _curated_params("memory_list_network_connections", {"os": "windows", "pid": 12})
+    assert _curated_params(
+        "memory_list_network_connections", {"os": "windows", "pid": 12}
+    ) == {}
     with pytest.raises(ValueError, match="Memmap"):
         _curated_params("memory_dump_process_memory", {"os": "windows", "pid": 12, "address": 1})
 
@@ -105,6 +106,70 @@ def test_curated_wrapper_selects_linux_socket_plugin(tmp_path: Path, monkeypatch
     assert result.structuredContent["plugin_resolved"] == "linux.sockstat.Sockstat"
     assert called["plugin"] == "linux.sockstat.Sockstat"
     assert called["params"] == {"pids": [12]}
+
+
+def test_curated_windows_netscan_filters_pid_after_plugin_run(tmp_path: Path, monkeypatch) -> None:
+    from mem_forensics_mcp_server import server
+
+    image = tmp_path / "memory.raw"
+    image.write_bytes(b"memory")
+    called: dict[str, object] = {}
+
+    async def fake_run(image_path: str, plugin: str, **kwargs):
+        called.update({"image_path": image_path, "plugin": plugin, **kwargs})
+        return {
+            "results": [
+                {"PID": 12, "Owner": "edge.exe"},
+                {"PID": 13, "Owner": "other.exe"},
+            ],
+            "volatility3": {"source": "test"},
+        }
+
+    monkeypatch.setattr(server, "run_vol3_api", fake_run)
+    result = asyncio.run(
+        _handle_curated_vol3_tool(
+            "memory_list_network_connections",
+            {"image_path": str(image), "os": "windows", "pid": 12},
+        )
+    )
+
+    assert not result.isError
+    assert result.structuredContent["plugin_resolved"] == "windows.netscan.NetScan"
+    assert called["plugin"] == "windows.netscan.NetScan"
+    assert called["params"] == {}
+    assert result.structuredContent["results"] == [{"PID": 12, "Owner": "edge.exe"}]
+    assert result.structuredContent["pid_filter"] == {"pid": 12, "matched": 1, "total": 2}
+
+
+def test_deprecated_malfind_name_resolves_to_current_plugin(monkeypatch) -> None:
+    from mem_forensics_mcp_server import server
+
+    catalog = {
+        "windows.malfind.malfind": {
+            "canonical_name": "windows.malfind.Malfind",
+            "os": "windows",
+            "aliases": ["malfind"],
+        },
+        "windows.malware.malfind.malfind": {
+            "canonical_name": "windows.malware.malfind.Malfind",
+            "os": "windows",
+            "aliases": ["malfind"],
+        },
+    }
+
+    async def fake_catalog():
+        return catalog
+
+    monkeypatch.setattr(server, "_catalog", fake_catalog)
+    monkeypatch.setattr(
+        server,
+        "_plugin_aliases",
+        {"malfind": {"windows.malfind.malfind", "windows.malware.malfind.malfind"}},
+    )
+
+    descriptor = asyncio.run(server._resolve_plugin("windows.malfind.Malfind", "windows"))
+
+    assert descriptor["canonical_name"] == "windows.malware.malfind.Malfind"
 
 
 def test_curated_wrapper_rejects_unsupported_os(tmp_path: Path) -> None:

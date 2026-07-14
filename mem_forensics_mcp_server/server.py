@@ -117,6 +117,9 @@ CURATED_VOL3_TOOLS = {
     "memory_list_security_ids": {"windows": "windows.getsids.GetSIDs"},
     "memory_scan_callbacks": {"windows": "windows.callbacks.Callbacks"},
 }
+VOL3_PLUGIN_ALIASES = {
+    "windows.malfind.malfind": "windows.malware.malfind.malfind",
+}
 
 
 @asynccontextmanager
@@ -214,8 +217,13 @@ async def _catalog() -> dict[str, dict[str, Any]]:
             for descriptor in descriptors:
                 canonical = descriptor["canonical_name"]
                 _plugin_catalog[canonical.lower()] = descriptor
-                for alias in descriptor.get("aliases", []):
-                    _plugin_aliases.setdefault(alias.lower(), set()).add(canonical.lower())
+        for descriptor in _plugin_catalog.values():
+            canonical = descriptor["canonical_name"].lower()
+            alias_target = VOL3_PLUGIN_ALIASES.get(canonical, canonical)
+            if alias_target not in _plugin_catalog:
+                alias_target = canonical
+            for alias in descriptor.get("aliases", []):
+                _plugin_aliases.setdefault(alias.lower(), set()).add(alias_target)
         return _plugin_catalog
 
 
@@ -234,17 +242,21 @@ def _native_plugin_name(plugin: str) -> Optional[str]:
 
 
 async def _resolve_plugin(plugin: str, os_name: Optional[str] = None) -> dict[str, Any]:
-    if "." in plugin:
-        descriptor = (await _catalog()).get(plugin.lower())
-        return descriptor or {"canonical_name": plugin, "os": os_name or "other", "aliases": []}
     catalog = await _catalog()
-    descriptor = catalog.get(plugin.lower())
-    alias_candidates = _plugin_aliases.get(plugin.lower(), set())
+    requested = plugin.lower()
+    alias_target = VOL3_PLUGIN_ALIASES.get(requested)
+    if alias_target in catalog:
+        requested = alias_target
+    if "." in plugin:
+        descriptor = catalog.get(requested)
+        return descriptor or {"canonical_name": plugin, "os": os_name or "other", "aliases": []}
+    descriptor = catalog.get(requested)
+    alias_candidates = _plugin_aliases.get(requested, set())
     if descriptor is None and alias_candidates:
         eligible = {
             canonical
             for canonical in alias_candidates
-            if not os_name or catalog[canonical].get("os") in {os_name, "other"}
+            if canonical in catalog and (not os_name or catalog[canonical].get("os") in {os_name, "other"})
         }
         if len(eligible) == 1:
             descriptor = catalog[next(iter(eligible))]
@@ -314,6 +326,29 @@ def _apply_filter(data: dict[str, Any], query: Optional[str]) -> dict[str, Any]:
             row for row in rows if lowered in json.dumps(row, default=str).lower()
         ]
         result["filter"] = {"query": query, "matched": len(result["results"]), "total": original}
+    return result
+
+
+def _apply_pid_filter(data: dict[str, Any], pid: Optional[int]) -> dict[str, Any]:
+    if pid is None:
+        return data
+    result = deepcopy(data)
+    rows = result.get("results")
+    if not isinstance(rows, list):
+        return result
+
+    filtered = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = row.get("PID", row.get("pid"))
+        try:
+            if value is not None and int(value) == pid:
+                filtered.append(row)
+        except (TypeError, ValueError):
+            continue
+    result["results"] = filtered
+    result["pid_filter"] = {"pid": pid, "matched": len(filtered), "total": len(rows)}
     return result
 
 
@@ -902,7 +937,7 @@ def _curated_params(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "memory_list_network_connections" and arguments.get("os") == "linux":
             params["pids"] = [pid]
         elif name == "memory_list_network_connections" and arguments.get("os") == "windows":
-            raise ValueError("Windows NetScan has no PID parameter; filter its returned rows instead")
+            pass
         elif name == "memory_dump_process_memory" and arguments.get("os") == "windows":
             params["pid"] = pid
         else:
@@ -943,6 +978,11 @@ async def _handle_curated_vol3_tool(name: str, arguments: dict[str, Any]) -> Cal
         return _error("unsupported_os", f"{name} is unavailable for {os_name}; supported: {supported}")
 
     params = _curated_params(name, {**arguments, "os": os_name})
+    pid_filter = (
+        _optional_integer(arguments.get("pid"), "pid")
+        if name == "memory_list_network_connections" and os_name == "windows"
+        else None
+    )
     result = await run_vol3_api(
         str(image),
         plugin,
@@ -952,6 +992,7 @@ async def _handle_curated_vol3_tool(name: str, arguments: dict[str, Any]) -> Cal
     if "error" in result:
         return _error(result.get("error_code", "vol3_error"), result["error"], details=result.get("details"))
 
+    result = _apply_pid_filter(result, pid_filter)
     dumped_files = result.pop("dumped_files", [])
     artifact_links = _artifact_links(dumped_files)
     normalized = {
