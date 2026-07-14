@@ -38,6 +38,7 @@ jobs:
       - name: Verify bundled Linux engine
         if: runner.os == 'Linux'
         run: |
+          chmod +x mem_forensics_mcp_server/engine/memoxide/x86_64/memoxide
           python - <<'PY'
           import asyncio
 
