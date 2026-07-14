@@ -50,7 +50,8 @@ symbols/
 .env
 
 # Test outputs
-test_*.py
+# Keep test source under version control. Pytest's default test_*.py naming
+# convention must not be ignored.
 .pytest_cache/
 .ruff_cache/
 
@@ -61,3 +62,9 @@ test_*.py
 # OS
 .DS_Store
 Thumbs.db
+
+# Rust build artifacts
+**/target/
+
+# Opencode local config
+opencode.json

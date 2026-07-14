@@ -27,6 +27,8 @@ use super::process_anomalies::Severity;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ThreatLevel {
+    /// Required triage stages did not complete, so no verdict is reliable.
+    Inconclusive,
     /// Active compromise detected (rootkit, C2, credential theft).
     Critical,
     /// Strong indicators of compromise (hidden processes, C2 connections).
@@ -37,6 +39,13 @@ pub enum ThreatLevel {
     Low,
     /// No significant findings.
     Clean,
+}
+
+/// One triage component that could not contribute findings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartialFailure {
+    pub component: String,
+    pub reason: String,
 }
 
 /// A cross-analyzer correlation finding.
@@ -67,6 +76,11 @@ pub struct Action {
 /// Complete triage report.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TriageReport {
+    /// Whether every required triage component completed successfully.
+    pub analysis_complete: bool,
+    /// Components that failed or were unavailable during triage.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub partial_failures: Vec<PartialFailure>,
     /// Overall threat assessment.
     pub threat_level: ThreatLevel,
     /// Numeric risk score (0-100).
@@ -161,26 +175,62 @@ pub fn run_with_head(
     ps_head_override: Option<u64>,
 ) -> TriageReport {
     info!("full_triage: starting comprehensive analysis...");
+    let mut partial_failures = Vec::new();
 
     // ── Step 1: Run all plugins ──────────────────────────────────────
 
     // pslist (requires VM)
     let pslist_procs = if let Some(vm) = kernel_vm {
-        pslist::run_with_head(symbols, vm.as_ref(), kernel_base, ps_head_override).unwrap_or_default()
+        match pslist::run_with_head(symbols, vm.as_ref(), kernel_base, ps_head_override) {
+            Ok(procs) => procs,
+            Err(error) => {
+                partial_failures.push(PartialFailure {
+                    component: "pslist".to_string(),
+                    reason: error,
+                });
+                Vec::new()
+            }
+        }
     } else {
+        partial_failures.push(PartialFailure {
+            component: "pslist".to_string(),
+            reason: "Skipped because kernel virtual memory is unavailable".to_string(),
+        });
         Vec::new()
     };
     info!("full_triage: pslist found {} processes", pslist_procs.len());
 
     // psscan (physical memory)
-    let psscan_procs = psscan::run(symbols, image, scan_chunk_size).unwrap_or_default();
+    let psscan_procs = match psscan::run(symbols, image, scan_chunk_size) {
+        Ok(procs) => procs,
+        Err(error) => {
+            partial_failures.push(PartialFailure {
+                component: "psscan".to_string(),
+                reason: error,
+            });
+            Vec::new()
+        }
+    };
     info!("full_triage: psscan found {} processes", psscan_procs.len());
 
     // cmdline (requires VM)
     let cmdlines = if let Some(vm) = kernel_vm {
         let physical = image.physical_layer();
-        cmdline::run_with_head(symbols, vm.as_ref(), physical, kernel_base, None, ps_head_override).unwrap_or_default()
+        match cmdline::run_with_head(symbols, vm.as_ref(), physical, kernel_base, None, ps_head_override) {
+            Ok(result) => result,
+            Err(error) => {
+                partial_failures.push(PartialFailure {
+                    component: "cmdline".to_string(),
+                    reason: error,
+                });
+                Vec::new()
+            }
+        }
     } else {
+        partial_failures.push(PartialFailure {
+            component: "cmdline".to_string(),
+            reason: "Skipped because kernel virtual memory is unavailable".to_string(),
+        });
         Vec::new()
     };
     info!("full_triage: extracted {} command lines", cmdlines.len());
@@ -190,22 +240,52 @@ pub fn run_with_head(
         .unwrap_or_else(|| netscan::NetscanOffsets::win10_19041_x64());
     let kernel_vm_access: Option<&dyn isf::MemoryAccess> =
         kernel_vm.map(|vm| vm.as_ref() as &dyn isf::MemoryAccess);
-    let netscan_result = netscan::run(symbols, image, kernel_vm_access, &netscan_offsets, scan_chunk_size).ok();
+    let netscan_result = match netscan::run(symbols, image, kernel_vm_access, &netscan_offsets, scan_chunk_size) {
+        Ok(result) => Some(result),
+        Err(error) => {
+            partial_failures.push(PartialFailure {
+                component: "netscan".to_string(),
+                reason: error,
+            });
+            None
+        }
+    };
     if let Some(ref nr) = netscan_result {
         info!("full_triage: netscan found {} connections", nr.total);
     }
 
     // cmdscan
-    let cmdscan_result = cmdscan::run(image, scan_chunk_size, 500).ok();
+    let cmdscan_result = match cmdscan::run(image, scan_chunk_size, 500) {
+        Ok(result) => Some(result),
+        Err(error) => {
+            partial_failures.push(PartialFailure {
+                component: "cmdscan".to_string(),
+                reason: error,
+            });
+            None
+        }
+    };
     let cmdscan_hits = cmdscan_result.as_ref().map(|r| r.total_hits).unwrap_or(0);
     info!("full_triage: cmdscan found {} suspicious hits", cmdscan_hits);
 
     // malfind (requires VM + physical layer)
     let malfind_regions = if let Some(vm) = kernel_vm {
         let physical = image.physical_layer();
-        malfind::run(symbols, vm.as_ref(), physical, kernel_base, None, ps_head_override, 200)
-            .unwrap_or_default()
+        match malfind::run(symbols, vm.as_ref(), physical, kernel_base, None, ps_head_override, 200) {
+            Ok(result) => result,
+            Err(error) => {
+                partial_failures.push(PartialFailure {
+                    component: "malfind".to_string(),
+                    reason: error,
+                });
+                Vec::new()
+            }
+        }
     } else {
+        partial_failures.push(PartialFailure {
+            component: "malfind".to_string(),
+            reason: "Skipped because kernel virtual memory is unavailable".to_string(),
+        });
         Vec::new()
     };
     info!("full_triage: malfind found {} injected regions ({} with PE headers)",
@@ -267,9 +347,30 @@ pub fn run_with_head(
     let correlations = build_correlations(&ctx);
     let iocs = extract_iocs(&ctx);
     let risk_score = compute_risk_score(&ctx, &correlations);
-    let threat_level = threat_level_from_score(risk_score);
-    let summary = build_summary(&ctx, &correlations, &threat_level, risk_score);
-    let recommended_actions = build_actions(&ctx, &correlations, &threat_level);
+    let threat_level = report_threat_level(risk_score, &partial_failures);
+    let mut summary = build_summary(&ctx, &correlations, &threat_level, risk_score);
+    if !partial_failures.is_empty() {
+        summary.push_str(&format!(
+            ". Analysis incomplete: {} component(s) failed or were unavailable",
+            partial_failures.len()
+        ));
+    }
+    let mut recommended_actions = build_actions(&ctx, &correlations, &threat_level);
+    if !partial_failures.is_empty() {
+        recommended_actions.push(Action {
+            priority: Severity::High,
+            action: "Resolve triage component failures and rerun".to_string(),
+            reason: format!(
+                "Triage is inconclusive because: {}",
+                partial_failures
+                    .iter()
+                    .map(|failure| format!("{}: {}", failure.component, failure.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        });
+        recommended_actions.sort_by(|a, b| a.priority.cmp(&b.priority));
+    }
 
     info!(
         "full_triage: complete — threat_level={:?}, risk_score={}, correlations={}, iocs={}",
@@ -280,6 +381,8 @@ pub fn run_with_head(
     );
 
     TriageReport {
+        analysis_complete: partial_failures.is_empty(),
+        partial_failures,
         threat_level,
         risk_score,
         summary,
@@ -694,6 +797,14 @@ fn threat_level_from_score(score: u32) -> ThreatLevel {
         21..=45 => ThreatLevel::Medium,
         46..=70 => ThreatLevel::High,
         _ => ThreatLevel::Critical,
+    }
+}
+
+fn report_threat_level(score: u32, partial_failures: &[PartialFailure]) -> ThreatLevel {
+    if partial_failures.is_empty() {
+        threat_level_from_score(score)
+    } else {
+        ThreatLevel::Inconclusive
     }
 }
 
@@ -1126,6 +1237,17 @@ mod tests {
         let score = compute_risk_score(&ctx_bad, &corrs);
         assert!(score >= 70, "expected score >= 70, got {}", score);
         assert_eq!(threat_level_from_score(score), ThreatLevel::Critical);
+    }
+
+    #[test]
+    fn test_partial_failure_makes_verdict_inconclusive() {
+        let failures = vec![PartialFailure {
+            component: "netscan".to_string(),
+            reason: "missing type offsets".to_string(),
+        }];
+
+        assert_eq!(report_threat_level(0, &failures), ThreatLevel::Inconclusive);
+        assert_eq!(report_threat_level(80, &[]), ThreatLevel::Critical);
     }
 
     #[test]

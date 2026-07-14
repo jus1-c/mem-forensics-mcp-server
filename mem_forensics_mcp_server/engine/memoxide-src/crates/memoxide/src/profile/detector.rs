@@ -53,12 +53,15 @@ pub fn select_symbols_by_psscan_probe(
     image: &MemoryImage,
     pointer_size: usize,
     max_scan_bytes: u64,
+    max_candidates: usize,
 ) -> Result<Option<SelectedSymbols>, String> {
     let mut files = Vec::new();
     collect_isf_files(symbols_root, &mut files)?;
     if files.is_empty() {
         return Ok(None);
     }
+    files.sort();
+    files.truncate(max_candidates);
 
     let mut best: Option<(u64, PathBuf, IsfSymbols)> = None; // (score, path, symbols)
 

@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.11"
+          - os: macos-latest
+            python-version: "3.11"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest ruff build
+      - name: Lint
+        run: python -m ruff check mem_forensics_mcp_server tests
+      - name: Test
+        run: python -m pytest
+      - name: Verify bundled Linux engine
+        if: runner.os == 'Linux'
+        run: |
+          python - <<'PY'
+          import asyncio
+
+          from mem_forensics_mcp_server.engine.memoxide_client import MemoxideClient
+
+
+          async def main():
+              client = MemoxideClient(call_timeout=15)
+              assert await client.start()
+              result = await client._send_request("tools/list", {})
+              names = {tool["name"] for tool in result.get("tools", [])}
+              assert {
+                  "memory_close_session",
+                  "memory_hashdump",
+                  "memory_list_registry_hives",
+                  "memory_registry_query",
+              } <= names
+              await client.stop()
+
+
+          asyncio.run(main())
+          PY
+      - name: Build wheel
+        run: python -m build --wheel
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mem_forensics_mcp_server/engine/memoxide-src
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check
+        run: cargo check --workspace
+      - name: Test
+        run: cargo test --workspace
+
+  native:
+    name: Build Memoxide (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: windows-x86_64
+            os: windows-latest
+          - name: macos
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release
+        working-directory: mem_forensics_mcp_server/engine/memoxide-src
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install smoke-test dependencies
+        run: python -m pip install --upgrade pip python-dotenv
+      - name: Stage binary in package layout
+        id: stage
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import platform
+          import shutil
+          import stat
+          from pathlib import Path
+
+          system = platform.system().lower()
+          system = {"darwin": "macos"}.get(system, system)
+          machine = platform.machine()
+          architecture = {
+              "AMD64": "x86_64",
+              "x86_64": "x86_64",
+              "aarch64": "aarch64",
+              "arm64": "aarch64",
+          }.get(machine, machine)
+          executable = "memoxide.exe" if system == "windows" else "memoxide"
+          package_name = executable
+          if system == "macos":
+              package_name = "memoxide.macos"
+
+          source = Path("mem_forensics_mcp_server/engine/memoxide-src/target/release") / executable
+          destination = Path("mem_forensics_mcp_server/engine/memoxide") / architecture / package_name
+          if not source.is_file():
+              raise SystemExit(f"release binary not found: {source}")
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(source, destination)
+          if system != "windows":
+              destination.chmod(destination.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"system={system}\n")
+              output.write(f"architecture={architecture}\n")
+              output.write(f"binary={destination.as_posix()}\n")
+          print(f"Staged {source} as {destination}")
+          PY
+      - name: Verify native binary
+        env:
+          STAGED_BINARY: ${{ steps.stage.outputs.binary }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import asyncio
+          import os
+          from pathlib import Path
+
+          from mem_forensics_mcp_server.engine.memoxide_client import MemoxideClient
+
+
+          async def main():
+              client = MemoxideClient(binary_path=Path(os.environ["STAGED_BINARY"]), call_timeout=15)
+              assert await client.start()
+              result = await client._send_request("tools/list", {})
+              names = {tool["name"] for tool in result.get("tools", [])}
+              assert "memory_analyze_image" in names
+              await client.stop()
+
+
+          asyncio.run(main())
+          PY
+      - name: Install wheel builder
+        run: python -m pip install --upgrade pip build
+      - name: Build platform wheel
+        run: python -m build --wheel
+      - name: Upload platform wheel and binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: memoxide-${{ steps.stage.outputs.system }}-${{ steps.stage.outputs.architecture }}
+          if-no-files-found: error
+          path: |
+            dist/*.whl
+            ${{ steps.stage.outputs.binary }}

@@ -123,8 +123,9 @@ pub fn analyze(connections: &[NetworkConnection], cmdlines: Option<&[CmdlineInfo
         }
     }
 
-    // Sort most severe first.
-    flagged.sort_by(|a, b| b.severity.cmp(&a.severity));
+    // Severity derives Ord as Critical < High < Medium < Low, so ascending
+    // order places the most severe findings first.
+    flagged.sort_by(|a, b| a.severity.cmp(&b.severity));
 
     let critical_count = flagged
         .iter()
@@ -160,7 +161,7 @@ fn map_port_severity(s: suspicious_ports::PortSeverity) -> Severity {
 fn max_severity(cur: Option<Severity>, next: Severity) -> Option<Severity> {
     match cur {
         None => Some(next),
-        Some(c) => Some(if next > c { next } else { c }),
+        Some(c) => Some(if next < c { next } else { c }),
     }
 }
 

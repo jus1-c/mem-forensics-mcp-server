@@ -33,6 +33,15 @@ where
     }
 }
 
+fn deserialize_u64_hex<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_optional_u64_hex(deserializer)?.ok_or_else(|| {
+        serde::de::Error::custom("expected unsigned 64-bit integer or hex string")
+    })
+}
+
 /// Request to analyze a memory image.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AnalyzeImageRequest {
@@ -64,6 +73,30 @@ pub struct RunPluginRequest {
 pub struct SessionRequest {
     /// Session ID from a previous analyze_image call.
     pub session_id: String,
+}
+
+/// Request to read a registry hive discovered in physical memory.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RegistryQueryRequest {
+    /// Session ID from a previous analyze_image call.
+    pub session_id: String,
+    /// Physical REGF header offset. Accepts decimal or hex strings.
+    #[serde(deserialize_with = "deserialize_u64_hex")]
+    pub hive_offset: u64,
+    /// Registry key path relative to the hive root. Empty selects the root.
+    #[serde(default)]
+    pub key_path: String,
+    /// Optional named value. Omit to enumerate all values in the key.
+    pub value_name: Option<String>,
+}
+
+/// Explicit opt-in required before returning credential material.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct HashdumpRequest {
+    /// Session ID from a previous analyze_image call.
+    pub session_id: String,
+    /// Must be true to acknowledge that credential hashes are sensitive.
+    pub allow_sensitive: bool,
 }
 
 /// Process information from pslist/psscan.

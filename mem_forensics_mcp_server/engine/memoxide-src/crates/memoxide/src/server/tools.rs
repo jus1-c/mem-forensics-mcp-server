@@ -4,6 +4,7 @@ use crate::analyzers::{full_triage, network_analyzer, process_anomalies};
 use crate::memory::image::MemoryImage;
 use crate::plugins::{cmdline, cmdscan, dlllist, malfind, memsearch, netscan, pslist, psscan};
 use crate::profile::{detector, kdbg, kuser, rsds};
+use crate::registry::{crypto, hive};
 use crate::server::session::SessionStore;
 use crate::server::types::*;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -15,7 +16,8 @@ use tracing::info;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_WINDOWS_SYMBOLS_ROOT: &str = "symbols/windows";
 const AUTO_PSSCAN_PROBE_BYTES: u64 = 256 * 1024 * 1024; // 256MB
-const AUTO_RSDS_SCAN_BYTES: u64 = u64::MAX; // Scan entire image — RSDS scan is cheap (memchr 4-byte sig)
+const AUTO_PSSCAN_MAX_ISF_CANDIDATES: usize = 24;
+const AUTO_RSDS_SCAN_BYTES: u64 = 2 * 1024 * 1024 * 1024; // Bound startup work on large images.
 
 /// Available plugins.
 const PLUGINS: &[(&str, &str, &str)] = &[
@@ -33,6 +35,12 @@ const PLUGINS: &[(&str, &str, &str)] = &[
 
 /// Default chunk size for physical memory scanning (16 MB).
 const SCAN_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
+fn windows_symbols_root() -> std::path::PathBuf {
+    std::env::var_os("MEMOXIDE_SYMBOLS_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_WINDOWS_SYMBOLS_ROOT))
+}
 
 /// Format a byte slice as a classic hex dump with offset markers and ASCII sidebar.
 fn format_hex_dump(data: &[u8], base_offset: u64) -> String {
@@ -181,8 +189,8 @@ impl MemoxideServer {
             // Auto-load kernel ISF if not provided and we have KDBG.SizeEProcess to match on.
             if session.symbols.is_none() {
                 if let Some(k) = best_kdbg.as_ref() {
-                    let root = std::path::Path::new(DEFAULT_WINDOWS_SYMBOLS_ROOT);
-                    match detector::select_symbols_for_kdbg(root, k) {
+                    let root = windows_symbols_root();
+                        match detector::select_symbols_for_kdbg(&root, k) {
                         Ok(Some(sel)) => {
                             session.profile = Some(sel.isf_path.clone());
                             session.symbols = Some(std::sync::Arc::new(sel.symbols));
@@ -204,8 +212,8 @@ impl MemoxideServer {
             // download/conversion fails) since probing 3000+ ISFs won't help.
             let mut rsds_found_kernel_guid = false;
             if session.symbols.is_none() {
-                let root = std::path::Path::new(DEFAULT_WINDOWS_SYMBOLS_ROOT);
-                match detector::select_symbols_by_rsds(root, &session.image, AUTO_RSDS_SCAN_BYTES) {
+                    let root = windows_symbols_root();
+                    match detector::select_symbols_by_rsds(&root, &session.image, AUTO_RSDS_SCAN_BYTES) {
                     Ok(result) => {
                         rsds_found_kernel_guid = result.kernel_guid_found;
                         if let Some(sel) = result.symbols {
@@ -227,12 +235,13 @@ impl MemoxideServer {
             // SKIP if RSDS found a kernel GUID — probing 3000+ ISFs won't help when we
             // know the exact GUID but couldn't resolve it.
             if session.symbols.is_none() && !rsds_found_kernel_guid {
-                let root = std::path::Path::new(DEFAULT_WINDOWS_SYMBOLS_ROOT);
+                let root = windows_symbols_root();
                 match detector::select_symbols_by_psscan_probe(
-                    root,
+                    &root,
                     &session.image,
                     8, // x64 only for now
                     AUTO_PSSCAN_PROBE_BYTES,
+                    AUTO_PSSCAN_MAX_ISF_CANDIDATES,
                 ) {
                     Ok(Some(sel)) => {
                         session.profile = Some(sel.isf_path.clone());
@@ -358,6 +367,19 @@ impl MemoxideServer {
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&infos).unwrap(),
+        )]))
+    }
+
+    /// Close an analysis session and release its mapped image and cached state.
+    #[tool(description = "Close one memory analysis session. Fields: session_id.")]
+    async fn memory_close_session(
+        &self,
+        Parameters(req): Parameters<SessionRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let closed = self.sessions.remove_session(&req.session_id).await;
+        let response = json!({"session_id": req.session_id, "closed": closed});
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&response).unwrap(),
         )]))
     }
 
@@ -864,6 +886,133 @@ impl MemoxideServer {
             "session_id": req.session_id,
             "kdbg_count": results.len(),
             "kdbg_entries": results
+        }).to_string())]))
+    }
+
+    /// List registry hives found in physical memory. Does not require symbols.
+    #[tool(description = "Discover Windows registry hives (REGF records) in physical memory. Returns hive offsets, names, lengths, and readability. Requires session_id.")]
+    async fn memory_list_registry_hives(
+        &self,
+        Parameters(req): Parameters<SessionRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let session_lock = self.sessions.get_session(&req.session_id).await.ok_or_else(|| {
+            McpError::invalid_params(format!("Session not found: {}", req.session_id), None)
+        })?;
+        let session = session_lock.read().await;
+        let hives = hive::find_hives(&session.image, SCAN_CHUNK_SIZE)
+            .map_err(|e| McpError::internal_error(format!("registry scan error: {}", e), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json!({
+            "session_id": req.session_id,
+            "hive_count": hives.len(),
+            "hives": hives,
+        }).to_string())]))
+    }
+
+    /// Query one registry key/value from a discovered hive. Does not require symbols.
+    #[tool(description = "Query a registry hive in memory. Fields: session_id, hive_offset (physical REGF address, decimal or hex), key_path (relative path, optional), value_name (optional). Omitting value_name returns key metadata and values. Binary values are returned as hex, capped at 4096 bytes.")]
+    async fn memory_registry_query(
+        &self,
+        Parameters(req): Parameters<RegistryQueryRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let session_lock = self.sessions.get_session(&req.session_id).await.ok_or_else(|| {
+            McpError::invalid_params(format!("Session not found: {}", req.session_id), None)
+        })?;
+        let session = session_lock.read().await;
+        let hives = hive::find_hives(&session.image, SCAN_CHUNK_SIZE)
+            .map_err(|e| McpError::internal_error(format!("registry scan error: {}", e), None))?;
+        let target = hives.into_iter().find(|h| h.regf_offset == req.hive_offset).ok_or_else(|| {
+            McpError::invalid_params(format!("No registry hive found at {:#x}", req.hive_offset), None)
+        })?;
+        if !target.valid_root {
+            return Err(McpError::invalid_params(
+                format!("Registry hive at {:#x} has an unreadable root", req.hive_offset),
+                None,
+            ));
+        }
+        let reader = hive::HiveReader::new(&session.image, &target);
+        let key = reader.open_key(target.root_cell_offset, &req.key_path)
+            .map_err(|e| McpError::invalid_params(format!("registry key error: {}", e), None))?;
+        let render_value = |value: hive::KeyValue| {
+            let truncated = value.data.len() > 4096;
+            let shown = &value.data[..value.data.len().min(4096)];
+            json!({
+                "name": value.name,
+                "value_type": value.value_type,
+                "data_hex": hex::encode(shown),
+                "data_length": value.data.len(),
+                "truncated": truncated,
+            })
+        };
+        let values: Vec<_> = if let Some(name) = req.value_name.as_deref() {
+            vec![render_value(reader.get_value(&key, name).map_err(|e| {
+                McpError::invalid_params(format!("registry value error: {}", e), None)
+            })?)]
+        } else {
+            reader.values(&key)
+                .map_err(|e| McpError::internal_error(format!("registry values error: {}", e), None))?
+                .into_iter()
+                .map(render_value)
+                .collect()
+        };
+        let subkeys: Vec<_> = reader.subkeys(&key)
+            .map_err(|e| McpError::internal_error(format!("registry subkeys error: {}", e), None))?
+            .into_iter()
+            .take(1000)
+            .map(|subkey| json!({"name": subkey.name, "subkey_count": subkey.subkey_count, "value_count": subkey.value_count}))
+            .collect();
+        Ok(CallToolResult::success(vec![Content::text(json!({
+            "session_id": req.session_id,
+            "hive": target,
+            "key": {
+                "name": key.name,
+                "path": req.key_path,
+                "subkey_count": key.subkey_count,
+                "value_count": key.value_count,
+            },
+            "values": values,
+            "subkeys": subkeys,
+        }).to_string())]))
+    }
+
+    /// Extract SAM credential hashes only after an explicit sensitive-data opt-in.
+    #[tool(description = "Extract Windows SAM credential hashes from in-memory SYSTEM and SAM hives. Requires session_id and allow_sensitive=true. This returns sensitive credential material; it is never included in normal triage output.")]
+    async fn memory_hashdump(
+        &self,
+        Parameters(req): Parameters<HashdumpRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !req.allow_sensitive {
+            return Err(McpError::invalid_params(
+                "Set allow_sensitive=true to acknowledge credential-hash disclosure".to_string(),
+                None,
+            ));
+        }
+        let session_lock = self.sessions.get_session(&req.session_id).await.ok_or_else(|| {
+            McpError::invalid_params(format!("Session not found: {}", req.session_id), None)
+        })?;
+        let session = session_lock.read().await;
+        let hives = hive::find_hives(&session.image, SCAN_CHUNK_SIZE)
+            .map_err(|e| McpError::internal_error(format!("registry scan error: {}", e), None))?;
+        let system = hive::find_system_hive(&hives).ok_or_else(|| {
+            McpError::invalid_params("SYSTEM hive not found in memory".to_string(), None)
+        })?;
+        let sam = hive::find_sam_hive(&hives).ok_or_else(|| {
+            McpError::invalid_params("SAM hive not found in memory".to_string(), None)
+        })?;
+        if !system.valid_root || !sam.valid_root {
+            return Err(McpError::invalid_params(
+                "SYSTEM or SAM hive root is unreadable".to_string(),
+                None,
+            ));
+        }
+        let boot_key = crypto::extract_boot_key(&session.image, system)
+            .map_err(|e| McpError::internal_error(format!("boot key extraction error: {}", e), None))?;
+        let users = crypto::extract_sam_hashes(&session.image, sam, &boot_key)
+            .map_err(|e| McpError::internal_error(format!("SAM hash extraction error: {}", e), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json!({
+            "session_id": req.session_id,
+            "sensitive": true,
+            "user_count": users.len(),
+            "users": users,
         }).to_string())]))
     }
 

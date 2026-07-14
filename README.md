@@ -11,7 +11,7 @@ This project is based on the excellent work by [xtk](https://github.com/x746b) i
 ## Features
 
 - **Two-Tier Architecture**: Fast Rust engine (memoxide) + Volatility3 fallback for maximum coverage
-- **Intelligent Caching**: 200-entry cache with LRU eviction (survives until server restart)
+- **Bounded Sessions and Results**: Image-fingerprint sessions, LRU cache, TTL-backed pagination, and opaque artifact resources
 - **Auto-Detection**: Automatic OS profile detection and plugin name resolution
 - **High Performance**: Rust native plugins for common operations (3s vs 60s)
 - **Full Coverage**: Access to available Volatility3 plugins through the Volatility3 API
@@ -39,7 +39,7 @@ Tested on Windows crash dump (2GB, ~109 processes):
 
 ### 1. Configure Volatility3 Source
 
-Volatility3 is loaded from a managed git checkout, not from the pip `volatility3` package.
+Volatility3 prefers a managed or explicitly trusted local Git checkout. A pinned pip package is used only when no valid Git source is available.
 
 Create `.env` in the project root:
 ```bash
@@ -51,8 +51,9 @@ Default `.env`:
 VOLATILITY3_REPO_URL=https://github.com/volatilityfoundation/volatility3
 VOLATILITY3_BRANCH=stable
 VOLATILITY3_REPO_PATH=.cache/volatility3
-VOLATILITY3_AUTO_UPDATE=true
-VOLATILITY3_UPDATE_INTERVAL_SECONDS=86400
+VOLATILITY3_UPDATE_MODE=background
+VOLATILITY3_PIP_FALLBACK=true
+MEMOXIDE_SYMBOLS_ROOT=/absolute/path/to/symbols/windows
 ```
 
 ### 2. Install MCP Server
@@ -111,6 +112,7 @@ Initialize memory image analysis and detect OS profile.
 
 **Parameters:**
 - `image_path`: Absolute path to memory dump (required)
+- `os_hint`: Optional `windows`, `linux`, or `mac`; use Linux/macOS hints to skip Windows-native profile detection
 - `dtb`: Override DTB address (optional, hex string)
 - `kernel_base`: Override kernel base address (optional, hex string)
 
@@ -130,10 +132,13 @@ Run a forensics plugin. Auto-routes to Rust (fast) or Vol3 (fallback).
 - `image_path`: Absolute path to memory dump (required)
 - `plugin`: Plugin name - can be short ("pslist") or full ("windows.pslist.PsList")
 - `args`: List of plugin arguments (optional, e.g., ["--pid", "1234"])
+- `params`: Typed plugin parameter object; use `memory_describe_plugin` first for requirements
+- `engine`: `auto`, `rust`, or `vol3`
+- `allow_fallback`: Allow Rust-to-Vol3 fallback (default `true`)
 - `filter`: Server-side filter string (optional)
 
 **Important Notes:**
-- Use `args` parameter for all plugin arguments
+- `args` supports compatibility CLI-style plugin arguments; `params` is preferred for new integrations
 - Output is always JSON-rendered through the Volatility3 API
 - `-r json` is accepted but ignored for backward compatibility
 - Short plugin names are auto-resolved to full format
@@ -199,12 +204,39 @@ List files found in memory using filescan plugin.
 - `image_path`: Absolute path to memory dump (required)
 - `args`: Optional args like `["--pid", "1234"]`
 
-### 7. memory_get_tool_help
+### Result pages and artifacts
 
-Get detailed help and examples for any tool.
+Large row results return a cursor for `memory_get_result_page`. Large structured reports and extracted files return an opaque `memforensics://artifact/<token>` resource link. Read it with the MCP resource API and release it early with `memory_release_result`; artifacts and result cursors expire automatically.
 
-**Parameters:**
-- `tool_name`: Name of tool (e.g., "memory_run_plugin")
+### Native analysis tools
+
+Native Memoxide tools include full triage, process anomalies, injected-code/C2/command analysis, registry hive enumeration and queries, KDBG/RSDS scans, and guarded hash dumping. `memory_hashdump` requires `allow_sensitive: true` because it returns credential material.
+
+### Curated cross-platform tools
+
+Use these wrappers when an investigation needs a common task rather than a Volatility plugin name. They still execute through the isolated Volatility3 API worker and return the resolved canonical plugin in provenance.
+
+| Tool | Windows | Linux | macOS |
+|------|---------|-------|-------|
+| `memory_dump_process_memory` | Memmap | Maps | Maps |
+| `memory_list_memory_maps` | VadInfo | Maps | Maps |
+| `memory_list_open_handles` | Handles | Lsof | Lsof |
+| `memory_list_network_connections` | NetScan | Sockstat | Netstat |
+| `memory_list_kernel_modules` | DriverScan | Lsmod | Lsmod |
+| `memory_list_environment` | Envars | Envars | Not available |
+| `memory_list_security_ids` | GetSIDs | Not available | Not available |
+| `memory_scan_callbacks` | Callbacks | Not available | Not available |
+
+`memory_extract_files` wraps Windows `DumpFiles`. `memory_dump_process_memory` enables Volatility's dump option; extracted bytes are returned as managed MCP artifact resources, not host filesystem paths.
+
+### Evidence workflow tools
+
+Pass structured results from `memory_run_plugin`, curated wrappers, or `memory_full_triage` directly into these tools:
+
+- `memory_build_timeline`: emits only parseable timestamp evidence in chronological order.
+- `memory_extract_iocs`: extracts conservative IP, URL, hash, PID, port, and domain observables while excluding secret-named fields.
+- `memory_diff_results`: compares two plugin result snapshots using optional identity fields such as `pid`, `offset`, or `name`.
+- `memory_response_playbook`: generates a reviewable preservation, validation, containment, and reporting sequence. It never changes a host.
 
 ## Usage Examples
 
@@ -260,21 +292,19 @@ File: /evidence/windows.dmp
 
 The server includes an intelligent caching system:
 
-- **Cache Size**: 200 entries (configurable)
-- **Cache Key**: `(image_path, plugin, args)`
-- **Persistence**: Cache survives until server restart
-- **Auto-Clear**: Cache cleared when analyzing new image
+- **Cache Key**: Image fingerprint, plugin, engine, arguments, and typed parameters
+- **Invalidation**: Cache is invalidated when an image changes or its session closes
 - **LRU Eviction**: Oldest entries removed when cache is full
 
 **Benefits:**
 - Second query for same plugin returns instantly
-- No TTL - cache valid until server restart
 - Separate cache per memory dump file
 
 ## Security Features
 
 - **Path Validation**: Only absolute paths allowed
 - **Engine Isolation**: Rust plugins run in separate subprocess
+- **Artifact Isolation**: Generated files are served only through server-managed opaque resource URIs
 - **Timeout Protection**: 60s timeout for Rust engine calls
 - **Size Limits**: Configurable response size limits
 - **No Secrets**: No logging of sensitive memory contents
@@ -286,8 +316,10 @@ The server includes an intelligent caching system:
 | `VOLATILITY3_REPO_URL` | Volatility3 git repository URL | `https://github.com/volatilityfoundation/volatility3` |
 | `VOLATILITY3_BRANCH` | Volatility3 branch to use | `stable` |
 | `VOLATILITY3_REPO_PATH` | Local checkout path, relative to project root if not absolute | `.cache/volatility3` |
-| `VOLATILITY3_AUTO_UPDATE` | Auto-update checkout on startup when due | `true` |
-| `VOLATILITY3_UPDATE_INTERVAL_SECONDS` | Auto-update interval | `86400` |
+| `VOLATILITY3_UPDATE_MODE` | Git update mode; updates run after MCP startup | `background` |
+| `VOLATILITY3_PIP_FALLBACK` | Permit pinned pip fallback when no Git source is valid | `true` |
+| `VOLATILITY3_LOCAL_REPOS` | Explicit trusted local Git checkouts; comma/semicolon separated | Empty |
+| `MEMOXIDE_SYMBOLS_ROOT` | Absolute local Windows ISF symbol store forwarded to Memoxide | `symbols/windows` |
 
 ## Architecture
 
@@ -302,8 +334,8 @@ The server includes an intelligent caching system:
                                │                    └─────────────┘
                                ▼
                         ┌─────────────┐     ┌─────────────┐
-                        │    Cache    │────▶│  Volatility3│
-                        │ (200 entries)│     │ API Fallback│
+                         │  LRU Cache  │────▶│  Volatility3│
+                         │             │     │ API Fallback│
                         └─────────────┘     └─────────────┘
 ```
 
@@ -320,9 +352,10 @@ mem-forensics-mcp-server/
 │   │   ├── session.py           # Session management
 │   │   ├── cache.py             # Plugin result caching
 │   │   ├── settings.py          # .env settings loader
-│   │   ├── vol3_repo.py         # Managed Volatility3 git checkout
-│   │   ├── vol3_api.py          # Vol3 API backend
-│   │   └── vol3_cli.py          # Compatibility shim
+│   │   ├── vol3_provider.py     # Managed/trusted Volatility3 source selection
+│   │   ├── vol3_worker.py       # Isolated Vol3 Python API worker
+│   │   ├── results.py           # Pagination and artifact lifecycle
+│   │   └── jobs.py              # Background job lifecycle
 │   ├── engine/
 │   │   ├── memoxide_client.py   # Rust engine client
 │   │   └── memoxide/            # Prebuilt binaries
@@ -355,16 +388,34 @@ cargo build --release
 
 ### Memoxide not available
 
-Memoxide requires platform-specific binaries. Prebuilt binaries included for:
+Memoxide requires platform-specific binaries. This package currently includes:
 - Windows x86_64
 - Linux x86_64
-- macOS x86_64 & aarch64
+- Linux aarch64
+
+macOS uses Volatility3 unless a matching Memoxide binary is built and installed. The
+GitHub Actions `native` job builds a macOS binary for the current `macos-latest`
+runner architecture, stages it as `memoxide.macos`, builds a wheel, and uploads
+the wheel and raw binary as workflow artifacts.
 
 To build for other platforms:
 ```bash
 cd mem_forensics_mcp_server/engine/memoxide-src
 cargo build --release --target <target-triple>
 ```
+
+After building, place the executable under
+`mem_forensics_mcp_server/engine/memoxide/<architecture>/` using these names:
+
+- Linux: `memoxide`
+- Windows: `memoxide.exe`
+- macOS: `memoxide.macos`
+
+Run the `CI` workflow manually with **Run workflow** to produce platform build
+artifacts without requiring a local cross-compilation toolchain. The workflow
+does not commit generated binaries; download the matching wheel or binary from
+the workflow run. Platforms without a matching native binary continue using the
+Volatility3 fallback.
 
 ### Vol3 plugin requirements not met
 
@@ -379,20 +430,16 @@ Rust engine has 60s timeout. For very large dumps, Vol3 fallback will be used au
 ### Plugin argument errors
 
 This means the arguments passed do not match the plugin's Volatility3 requirements.
-Use `memory_get_tool_help` for MCP examples or call `memory_list_plugins` to verify the
+Use `memory_describe_plugin` for typed requirements or call `memory_list_plugins` to verify the
 resolved plugin name.
 
 ## Recent Updates
 
-### v0.1.19
-- Added Volatility3 API backend from managed git `stable` checkout
-- Added `.env`-only Volatility3 configuration and auto-update settings
-- ✨ Added intelligent caching system (200 entries)
-- ✨ Auto-plugin name resolution (pslist → windows.pslist.PsList)
-- ✨ Auto-analyze on first plugin call
-- ✨ Simplified args parameter (replaces pid/params)
-- 🔧 Removed memory_dump_process tool
-- 🔧 Improved error handling and logging
+### v0.2.0
+- Added isolated Volatility3 API workers with background Git source refresh and pinned pip fallback
+- Added typed plugin discovery, pagination, background jobs, YARA scanning, native registry tools, and sensitive hashdump gate
+- Added server-managed MCP artifact resources, session cleanup, bounded symbol fallback, and explicit incomplete-triage reporting
+- Added Python/Rust CI checks, platform-native Memoxide builds, and wheel packaging audit
 
 ## License
 
