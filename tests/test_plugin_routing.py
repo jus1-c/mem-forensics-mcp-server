@@ -6,6 +6,7 @@ import pytest
 from mem_forensics_mcp_server.server import (
     NATIVE_TOOL_NAMES,
     _curated_params,
+    _ensure_rust_session,
     _handle_analyze,
     _handle_curated_vol3_tool,
     _handle_native_analysis_tool,
@@ -194,13 +195,19 @@ def test_registry_query_forwards_top_level_typed_parameters(tmp_path: Path, monk
     captured: dict[str, object] = {}
 
     class Client:
-        async def call_tool(self, name: str, arguments: dict):
-            captured.update({"name": name, "arguments": arguments})
+        generation = 1
+
+        def is_available(self) -> bool:
+            return True
+
+        async def call_tool(self, name: str, arguments: dict, **kwargs):
+            captured.update({"name": name, "arguments": arguments, **kwargs})
             return {"results": []}
 
     session = server.get_session(image)
     assert session is not None
     session.rust_session_id = "native-session"
+    session.rust_generation = 1
 
     async def fake_ensure(*_args):
         return session, Client()
@@ -226,6 +233,7 @@ def test_registry_query_forwards_top_level_typed_parameters(tmp_path: Path, monk
         "key_path": "SAM\\Domains",
         "value_name": "F",
     }
+    assert captured["timeout"] == 400
 
 
 def test_linux_os_hint_skips_windows_native_profile(tmp_path: Path, monkeypatch) -> None:
@@ -244,3 +252,72 @@ def test_linux_os_hint_skips_windows_native_profile(tmp_path: Path, monkeypatch)
     assert result.structuredContent["ok"] is True
     assert result.structuredContent["os"] == "linux"
     assert result.structuredContent["engines"] == {"rust": False, "vol3": True}
+
+
+def test_concurrent_native_profile_runs_once(tmp_path: Path, monkeypatch) -> None:
+    from mem_forensics_mcp_server import server
+
+    class Client:
+        generation = 1
+
+        def is_available(self) -> bool:
+            return True
+
+        async def analyze_image(self, *_args, **_kwargs):
+            calls.append(1)
+            await entered.wait()
+            return {"session_id": "native-session", "profile": "test"}
+
+    image = tmp_path / "memory.raw"
+    image.write_bytes(b"memory")
+    calls: list[int] = []
+    entered = asyncio.Event()
+    client = Client()
+
+    async def fake_started():
+        return client
+
+    monkeypatch.setattr(server, "_get_memoxide_started", fake_started)
+
+    async def scenario():
+        first = asyncio.create_task(_ensure_rust_session(image, {}))
+        while not calls:
+            await asyncio.sleep(0)
+        second = asyncio.create_task(_ensure_rust_session(image, {}))
+        entered.set()
+        first_session, _ = await first
+        second_session, _ = await second
+        assert first_session.rust_session_id == "native-session"
+        assert second_session.rust_session_id == "native-session"
+
+    asyncio.run(scenario())
+    assert len(calls) == 1
+
+
+def test_analyze_reports_rust_false_for_stale_generation(tmp_path: Path, monkeypatch) -> None:
+    from mem_forensics_mcp_server import server
+
+    image = tmp_path / "memory.raw"
+    image.write_bytes(b"memory")
+    session = server.get_session(image)
+    assert session is not None
+    session.rust_session_id = "stale"
+    session.rust_generation = 1
+
+    class Client:
+        generation = 2
+
+        def is_available(self) -> bool:
+            return True
+
+    async def fake_ensure(*_args):
+        return session, Client()
+
+    monkeypatch.setattr(server, "_ensure_rust_session", fake_ensure)
+    monkeypatch.setattr(server, "get_vol3_status", lambda: {"available": False})
+
+    result = asyncio.run(_handle_analyze({"image_path": str(image)}))
+
+    assert result.structuredContent["ok"] is False
+    assert result.structuredContent["rust_session_id"] is None
+    assert result.structuredContent["engines"] == {"rust": False, "vol3": False}

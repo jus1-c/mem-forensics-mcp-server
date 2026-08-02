@@ -136,6 +136,7 @@ Run a forensics plugin. Auto-routes to Rust (fast) or Vol3 (fallback).
 - `engine`: `auto`, `rust`, or `vol3`
 - `allow_fallback`: Allow Rust-to-Vol3 fallback (default `true`)
 - `filter`: Server-side filter string (optional)
+- `background`: Run a long full-image scan as a cancellable job and return its `job_id` (default `false`)
 
 **Important Notes:**
 - `args` supports compatibility CLI-style plugin arguments; `params` is preferred for new integrations
@@ -305,7 +306,7 @@ The server includes an intelligent caching system:
 - **Path Validation**: Only absolute paths allowed
 - **Engine Isolation**: Rust plugins run in separate subprocess
 - **Artifact Isolation**: Generated files are served only through server-managed opaque resource URIs
-- **Timeout Protection**: 60s timeout for Rust engine calls
+- **Timeout Protection**: 60s for quick Rust calls; 400s for image profiling and full-image scans
 - **Size Limits**: Configurable response size limits
 - **No Secrets**: No logging of sensitive memory contents
 
@@ -425,7 +426,9 @@ Some memory dump formats may not be compatible with certain plugins. Error messa
 
 ### Timeout errors on large dumps
 
-Rust engine has 60s timeout. For very large dumps, Vol3 fallback will be used automatically.
+Quick Rust calls have a 60s timeout. Image profiling and full-image native scans have a 400s timeout.
+Use `background: true` for scans expected to exceed interactive latency, then poll `memory_get_job` or stop them with
+`memory_cancel_job`.
 
 ### Plugin argument errors
 

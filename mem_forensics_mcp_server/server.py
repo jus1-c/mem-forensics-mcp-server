@@ -6,11 +6,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional
+
+import anyio
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -25,6 +28,7 @@ from .config import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
     MEMOXIDE_BINARY,
+    PLUGIN_TIMEOUT,
     RUST_PLUGIN_ALIASES,
     RUST_PLUGINS,
 )
@@ -63,9 +67,11 @@ logging.basicConfig(
 
 _memoxide: Optional[MemoxideClient] = None
 _memoxide_lock = asyncio.Lock()
+_rust_profile_lock = asyncio.Lock()
 _plugin_catalog: dict[str, dict[str, Any]] = {}
 _plugin_aliases: dict[str, set[str]] = {}
 _catalog_lock = asyncio.Lock()
+_plugin_catalog_source: Optional[tuple[Any, ...]] = None
 
 NATIVE_TOOL_NAMES = {
     "memory_hashdump",
@@ -130,12 +136,15 @@ async def _server_lifespan(_server: Server):
     try:
         yield {}
     finally:
-        await get_job_manager().close()
-        await shutdown_vol3()
-        clear_sessions()
-        await _release_retired_sessions()
-        if _memoxide is not None:
-            await _memoxide.stop()
+        logger.info("MCP lifespan cleanup starting pid=%s", os.getpid())
+        with anyio.CancelScope(shield=True):
+            await get_job_manager().close()
+            await shutdown_vol3()
+            clear_sessions()
+            await _release_retired_sessions()
+            if _memoxide is not None:
+                await _memoxide.stop(reason="server_shutdown")
+        logger.info("MCP lifespan cleanup completed pid=%s", os.getpid())
 
 
 server = Server("mem-forensics-mcp-server", version=__version__, lifespan=_server_lifespan)
@@ -207,24 +216,37 @@ async def _get_memoxide_started() -> Optional[MemoxideClient]:
 
 
 async def _catalog() -> dict[str, dict[str, Any]]:
+    global _plugin_catalog_source
     async with _catalog_lock:
-        if _plugin_catalog:
+        while True:
+            source = _vol3_source_identity()
+            if _plugin_catalog and _plugin_catalog_source == source:
+                return _plugin_catalog
+            catalog = await list_vol3_plugin_catalog()
+            if "error" in catalog:
+                return _plugin_catalog
+            if _vol3_source_identity() != source:
+                continue
+            _plugin_catalog.clear()
+            _plugin_aliases.clear()
+            for descriptors in catalog.get("plugins", {}).values():
+                for descriptor in descriptors:
+                    canonical = descriptor["canonical_name"]
+                    _plugin_catalog[canonical.lower()] = descriptor
+            for descriptor in _plugin_catalog.values():
+                canonical = descriptor["canonical_name"].lower()
+                alias_target = VOL3_PLUGIN_ALIASES.get(canonical, canonical)
+                if alias_target not in _plugin_catalog:
+                    alias_target = canonical
+                for alias in descriptor.get("aliases", []):
+                    _plugin_aliases.setdefault(alias.lower(), set()).add(alias_target)
+            _plugin_catalog_source = source
             return _plugin_catalog
-        catalog = await list_vol3_plugin_catalog()
-        if "error" in catalog:
-            return _plugin_catalog
-        for descriptors in catalog.get("plugins", {}).values():
-            for descriptor in descriptors:
-                canonical = descriptor["canonical_name"]
-                _plugin_catalog[canonical.lower()] = descriptor
-        for descriptor in _plugin_catalog.values():
-            canonical = descriptor["canonical_name"].lower()
-            alias_target = VOL3_PLUGIN_ALIASES.get(canonical, canonical)
-            if alias_target not in _plugin_catalog:
-                alias_target = canonical
-            for alias in descriptor.get("aliases", []):
-                _plugin_aliases.setdefault(alias.lower(), set()).add(alias_target)
-        return _plugin_catalog
+
+
+def _vol3_source_identity() -> tuple[Any, ...]:
+    status = get_vol3_status()
+    return tuple(status.get(key) for key in ("kind", "path", "commit", "package_version"))
 
 
 def _native_plugin_name(plugin: str) -> Optional[str]:
@@ -363,22 +385,58 @@ def _native_result_to_common(result: dict[str, Any], plugin: str) -> dict[str, A
     return output
 
 
+def _rust_session_ready(session: Any, client: Optional[MemoxideClient]) -> bool:
+    return bool(
+        session
+        and client
+        and client.is_available()
+        and session.rust_session_id
+        and session.rust_generation == client.generation
+    )
+
+
+def _clear_rust_session(session: Any) -> None:
+    session.rust_session_id = None
+    session.rust_generation = None
+    if session.engine_source == "memoxide":
+        session.profile = None
+        session.symbol_identity = None
+        session.engine_source = None
+
+
 async def _ensure_rust_session(image: Path, arguments: dict[str, Any]) -> tuple[Optional[Any], Optional[MemoxideClient]]:
     await _release_retired_sessions()
     session = get_session(image)
     await _release_retired_sessions()
     client = await _get_memoxide_started()
     if client is None:
+        if session.rust_session_id:
+            _clear_rust_session(session)
         return session, None
-    if not session.rust_session_id:
+    if _rust_session_ready(session, client):
+        return session, client
+
+    # One Memoxide child maps one image at a time; concurrent profiles only add I/O contention.
+    async with _rust_profile_lock:
+        session = get_session(image)
+        client = await _get_memoxide_started()
+        if client is None:
+            return session, None
+        if _rust_session_ready(session, client):
+            return session, client
+        if session.rust_session_id:
+            logger.info("Discarding stale native session id=%s", session.rust_session_id)
+            _clear_rust_session(session)
         result = await client.analyze_image(
             str(image),
             isf_path=arguments.get("isf_path"),
             dtb=arguments.get("dtb"),
             kernel_base=arguments.get("kernel_base"),
+            timeout=PLUGIN_TIMEOUT,
         )
-        if result and result.get("session_id"):
+        if result and result.get("session_id") and client.is_available():
             session.rust_session_id = result["session_id"]
+            session.rust_generation = client.generation
             session.profile = {**result, "os": "windows"}
             session.symbol_identity = result.get("profile")
             session.engine_source = "memoxide"
@@ -393,7 +451,7 @@ async def _release_retired_sessions() -> None:
     client = _memoxide
     for session in retired:
         get_cache().invalidate(str(session.image_path))
-        if not session.rust_session_id or client is None or not client.is_available():
+        if not _rust_session_ready(session, client):
             continue
         result = await client.call_tool("memory_close_session", {"session_id": session.rust_session_id})
         if not result or not result.get("closed"):
@@ -409,7 +467,11 @@ async def list_tools() -> list[Tool]:
     integer_list = {"type": "array", "items": integer}
     page_options = {
         "page_size": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE_SIZE, "default": DEFAULT_PAGE_SIZE},
-        "background": {"type": "boolean", "default": False},
+        "background": {
+            "type": "boolean",
+            "default": False,
+            "description": "Run asynchronously and return a job_id; use for full-image scans",
+        },
     }
     curated_tools = [
         Tool(
@@ -516,7 +578,11 @@ async def list_tools() -> list[Tool]:
                     "allow_fallback": {"type": "boolean", "default": True},
                     "filter": {"type": "string"},
                     "page_size": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE_SIZE, "default": DEFAULT_PAGE_SIZE},
-                    "background": {"type": "boolean", "default": False, "description": "Run asynchronously and return a job_id"},
+                    "background": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Run asynchronously and return a job_id; use for full-image scans",
+                    },
                 },
                 "required": ["image_path", "plugin"],
             },
@@ -565,6 +631,11 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
+    try:
+        request_id = server.request_context.request_id
+    except LookupError:
+        request_id = None
+    logger.info("MCP tool request id=%s tool=%s", request_id, name)
     try:
         await _release_retired_sessions()
         if name == "memory_analyze_image":
@@ -618,6 +689,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
     except YaraScanError as exc:
         return _error(exc.code, str(exc))
     except asyncio.CancelledError:
+        logger.warning("MCP tool request cancelled id=%s tool=%s", request_id, name)
         raise
     except Exception as exc:
         logger.exception("Unhandled error in %s", name)
@@ -642,24 +714,31 @@ async def _handle_analyze(arguments: dict[str, Any]) -> CallToolResult:
     profile = session.profile if session and isinstance(session.profile, dict) else {}
     os_name = str(profile.get("os") or ("windows" if profile.get("windows_build") or profile.get("virtual_memory") else "unknown"))
     vol3 = get_vol3_status()
-    ready = bool((session and session.rust_session_id) or vol3.get("available"))
+    ready = bool(_rust_session_ready(session, client) or vol3.get("available"))
     return _success(
         {
             "ok": ready,
             "session_id": session.session_id if session else None,
-            "rust_session_id": session.rust_session_id if session else None,
+            "rust_session_id": session.rust_session_id if _rust_session_ready(session, client) else None,
             "image": fingerprint,
             "os": os_name,
             "profile": profile,
-            "engines": {"rust": client is not None, "vol3": vol3.get("available", False)},
+            "engines": {
+                "rust": _rust_session_ready(session, client),
+                "vol3": vol3.get("available", False),
+            },
             "provenance": {"volatility3": vol3},
         }
     )
 
 
 async def _handle_list_sessions() -> CallToolResult:
-    sessions = list_sessions()
     await _release_retired_sessions()
+    client = _memoxide
+    sessions = list_sessions()
+    for item in sessions:
+        session = get_session_by_id(item["session_id"])
+        item["rust_available"] = _rust_session_ready(session, client)
     return _success({"ok": True, "sessions": sessions}, store=False)
 
 
@@ -789,10 +868,15 @@ async def _try_native_plugin(
     arguments: dict[str, Any],
 ) -> Optional[dict[str, Any]]:
     session, client = await _ensure_rust_session(image, arguments)
-    if client is None or session is None or not session.rust_session_id:
+    if not _rust_session_ready(session, client):
         return None
     native_params = _native_params(args, params)
-    return await client.run_plugin(session.rust_session_id, plugin, native_params or None)
+    return await client.run_plugin(
+        session.rust_session_id,
+        plugin,
+        native_params or None,
+        timeout=PLUGIN_TIMEOUT,
+    )
 
 
 async def _handle_list_plugins() -> CallToolResult:
@@ -835,7 +919,7 @@ async def _handle_close_session(arguments: dict[str, Any]) -> CallToolResult:
     warning: Optional[str] = None
     if session.rust_session_id:
         client = _memoxide
-        if client is not None and client.is_available():
+        if _rust_session_ready(session, client):
             result = await client.call_tool("memory_close_session", {"session_id": session.rust_session_id})
             native_closed = bool(result and result.get("closed"))
             if not native_closed:
@@ -1047,10 +1131,10 @@ async def _handle_native_plugin_tool(name: str, arguments: dict[str, Any]) -> Ca
     image = _normalize_image_path(arguments["image_path"])
     plugin = NATIVE_PLUGIN_TOOLS[name]
     session, client = await _ensure_rust_session(image, arguments)
-    if client is None or session is None or not session.rust_session_id:
+    if not _rust_session_ready(session, client):
         return _error("rust_unavailable", "Native Rust engine is unavailable")
     params = arguments.get("params") or {}
-    result = await client.run_plugin(session.rust_session_id, plugin, params)
+    result = await client.run_plugin(session.rust_session_id, plugin, params, timeout=PLUGIN_TIMEOUT)
     if not result or "error" in result:
         return _error("rust_execution_failed", str((result or {}).get("error", "Native tool failed")))
     result = _native_result_to_common(result, plugin)
@@ -1060,7 +1144,7 @@ async def _handle_native_plugin_tool(name: str, arguments: dict[str, Any]) -> Ca
 async def _handle_native_analysis_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
     image = _normalize_image_path(arguments["image_path"])
     session, client = await _ensure_rust_session(image, arguments)
-    if client is None or session is None or not session.rust_session_id:
+    if not _rust_session_ready(session, client):
         return _error("rust_unavailable", "Native Rust engine is unavailable")
     tool_arguments = {"session_id": session.rust_session_id}
     params = arguments.get("params") or {}
@@ -1075,7 +1159,7 @@ async def _handle_native_analysis_tool(name: str, arguments: dict[str, Any]) -> 
                 tool_arguments[key] = arguments[key]
     if "allow_sensitive" in arguments:
         tool_arguments["allow_sensitive"] = bool(arguments["allow_sensitive"])
-    result = await client.call_tool(name, tool_arguments)
+    result = await client.call_tool(name, tool_arguments, timeout=PLUGIN_TIMEOUT)
     if not result or "error" in result:
         return _error("rust_execution_failed", str((result or {}).get("error", "Native tool failed")))
     return _success({"ok": True, "engine": "rust", **result, "provenance": {"image": _image_fingerprint(image)}})
@@ -1210,9 +1294,11 @@ async def read_resource(uri: Any) -> list[ReadResourceContents]:
 
 
 async def main() -> None:
-    logger.info("Starting mem-forensics-mcp-server v%s", __version__)
+    logger.info("Starting mem-forensics-mcp-server v%s pid=%s", __version__, os.getpid())
     async with stdio_server() as (read_stream, write_stream):
+        logger.info("MCP stdio transport entered pid=%s", os.getpid())
         await server.run(read_stream, write_stream, server.create_initialization_options())
+    logger.info("MCP stdio transport closed pid=%s", os.getpid())
 
 
 def run() -> None:

@@ -23,6 +23,7 @@ class Session:
     image_path: Path
     session_id: str = field(default_factory=lambda: f"mem_{secrets.token_urlsafe(12)}")
     rust_session_id: Optional[str] = None
+    rust_generation: Optional[int] = None
     profile: Optional[dict] = None
     created_at: float = field(default_factory=time.time)
     last_used_at: float = field(default_factory=time.time)

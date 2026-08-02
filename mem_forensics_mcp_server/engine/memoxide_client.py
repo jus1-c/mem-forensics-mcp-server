@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+import anyio
+
 from ..config import (
     MEMOXIDE_BINARY,
     MEMOXIDE_CALL_TIMEOUT,
@@ -35,7 +37,10 @@ class MemoxideClient:
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._start_lock = asyncio.Lock()
+        self._request_lock = asyncio.Lock()
         self._stderr_tail: list[str] = []
+        self._generation = 0
+        self._protocol_open = False
 
     @property
     def binary_available(self) -> bool:
@@ -48,7 +53,12 @@ class MemoxideClient:
             return False
         if self._process is None:
             return False
-        return self._process.returncode is None
+        return self._protocol_open and self._process.returncode is None
+
+    @property
+    def generation(self) -> int:
+        """Incremented only after a native process completes MCP initialization."""
+        return self._generation
 
     async def start(self) -> bool:
         """Start the memoxide subprocess."""
@@ -59,6 +69,8 @@ class MemoxideClient:
 
             if self.is_available():
                 return True
+            if self._process is not None:
+                await self.stop(reason="restart_unavailable")
 
             try:
                 child_env = os.environ.copy()
@@ -71,6 +83,8 @@ class MemoxideClient:
                     limit=16 * 1024 * 1024,
                     env=child_env,
                 )
+                self._protocol_open = True
+                logger.info("Started Memoxide engine pid=%s", self._process.pid)
                 self._reader_task = asyncio.create_task(self._read_responses())
                 self._stderr_task = asyncio.create_task(self._drain_stderr())
 
@@ -83,18 +97,31 @@ class MemoxideClient:
                     },
                 )
 
-                if init_result is not None:
+                if init_result is not None and "error" not in init_result:
                     await self._send_notification("notifications/initialized", {})
-                    logger.info("Memoxide engine started")
+                    self._generation += 1
+                    logger.info(
+                        "Memoxide engine started pid=%s generation=%s",
+                        self._process.pid if self._process else None,
+                        self._generation,
+                    )
                     return True
+                logger.error("Memoxide initialization failed: %s", init_result)
+            except asyncio.CancelledError:
+                logger.warning("Memoxide startup cancelled")
+                with anyio.CancelScope(shield=True):
+                    await self.stop(reason="startup_cancelled")
+                raise
             except Exception as exc:
                 logger.error("Failed to start memoxide: %s", exc)
 
-            await self.stop()
+            with anyio.CancelScope(shield=True):
+                await self.stop(reason="initialization_failed")
             return False
 
-    async def stop(self) -> None:
+    async def stop(self, *, reason: str = "requested") -> None:
         """Stop the subprocess."""
+        self._protocol_open = False
         if self._reader_task:
             self._reader_task.cancel()
             try:
@@ -103,15 +130,28 @@ class MemoxideClient:
                 pass
             self._reader_task = None
 
-        if self._process:
+        process = self._process
+        if process:
             try:
-                self._process.terminate()
-                await asyncio.wait_for(self._process.wait(), timeout=MEMOXIDE_STOP_TIMEOUT)
+                if process.returncode is None:
+                    logger.warning("Stopping Memoxide engine pid=%s reason=%s", process.pid, reason)
+                    process.terminate()
+                    await asyncio.wait_for(process.wait(), timeout=MEMOXIDE_STOP_TIMEOUT)
             except (asyncio.TimeoutError, ProcessLookupError):
                 try:
-                    self._process.kill()
+                    process.kill()
                 except ProcessLookupError:
                     pass
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=MEMOXIDE_STOP_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.error("Memoxide engine pid=%s did not exit after kill", process.pid)
+            logger.info(
+                "Memoxide engine stopped pid=%s %s reason=%s",
+                process.pid,
+                self._exit_status(process.returncode),
+                reason,
+            )
             self._process = None
 
         if self._stderr_task:
@@ -135,6 +175,12 @@ class MemoxideClient:
                     break
                 line = await self._process.stdout.readline()
                 if not line:
+                    self._protocol_open = False
+                    logger.warning(
+                        "Memoxide stdout closed pid=%s %s",
+                        self._process.pid,
+                        self._exit_status(self._process.returncode),
+                    )
                     break
 
                 line_str = line.decode("utf-8").strip()
@@ -185,46 +231,76 @@ class MemoxideClient:
                 future.set_result({"error": {"message": message, "stderr": self._stderr_tail[-3:]}})
         self._pending.clear()
 
-    async def _send_request(self, method: str, params: dict) -> Optional[dict]:
+    async def _send_request(
+        self,
+        method: str,
+        params: dict,
+        *,
+        timeout: Optional[float] = None,
+    ) -> Optional[dict]:
         """Send JSON-RPC request."""
-        if not self._process or self._process.returncode is not None:
-            logger.warning("Cannot send request: process not available")
-            return None
+        retried = False
+        while True:
+            async with self._request_lock:
+                process = self._process
+                unavailable = (
+                    not self._protocol_open
+                    or process is None
+                    or process.returncode is not None
+                    or process.stdin is None
+                )
+                if unavailable:
+                    if method == "initialize":
+                        logger.warning("Cannot initialize Memoxide: process is not available")
+                        return None
+                    if retried:
+                        logger.error("Memoxide remained unavailable after restart for method=%s", method)
+                        return None
+                else:
+                    self._request_id += 1
+                    req_id = self._request_id
+                    request = {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": method,
+                        "params": params,
+                    }
+                    request_timeout = timeout if timeout is not None else self._call_timeout
+                    logger.debug(
+                        "Sending Memoxide request id=%s method=%s pid=%s timeout=%ss",
+                        req_id,
+                        method,
+                        process.pid,
+                        request_timeout,
+                    )
 
-        self._request_id += 1
-        req_id = self._request_id
-
-        request = {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "method": method,
-            "params": params,
-        }
-
-        request_str = json.dumps(request)
-        logger.debug("Sending Memoxide JSON-RPC request %s", req_id)
-
-        future = asyncio.get_event_loop().create_future()
-        self._pending[req_id] = future
-
-        try:
-            request_bytes = (request_str + "\n").encode("utf-8")
-            self._process.stdin.write(request_bytes)
-            await self._process.stdin.drain()
-            result = await asyncio.wait_for(future, timeout=self._call_timeout)
-            return result
-
-        except asyncio.TimeoutError:
-            self._pending.pop(req_id, None)
-            logger.error("Memoxide request %s timed out after %ss", req_id, self._call_timeout)
-            # The operation may still be scanning in the child. Restarting it
-            # prevents a Vol3 fallback from competing for the same dump.
-            await self.stop()
-            return None
-        except Exception as e:
-            self._pending.pop(req_id, None)
-            logger.error("Memoxide request %s failed: %s", req_id, e)
-            return None
+                    future = asyncio.get_running_loop().create_future()
+                    self._pending[req_id] = future
+                    try:
+                        process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+                        await process.stdin.drain()
+                        return await asyncio.wait_for(future, timeout=request_timeout)
+                    except asyncio.TimeoutError:
+                        self._pending.pop(req_id, None)
+                        logger.error("Memoxide request id=%s method=%s timed out after %ss", req_id, method, request_timeout)
+                        # The operation may still be scanning in the child. Restarting it
+                        # prevents a Vol3 fallback from competing for the same dump.
+                        with anyio.CancelScope(shield=True):
+                            await self.stop(reason=f"request {req_id} {method} timed out")
+                        return None
+                    except asyncio.CancelledError:
+                        self._pending.pop(req_id, None)
+                        logger.warning("Memoxide request cancelled id=%s method=%s", req_id, method)
+                        with anyio.CancelScope(shield=True):
+                            await self.stop(reason=f"request {req_id} {method} cancelled")
+                        raise
+                    except Exception as exc:
+                        self._pending.pop(req_id, None)
+                        logger.error("Memoxide request id=%s method=%s failed: %s", req_id, method, exc)
+                        return None
+            if not await self.start():
+                return None
+            retried = True
 
     async def _send_notification(self, method: str, params: dict) -> None:
         """Send JSON-RPC notification (no response expected)."""
@@ -245,7 +321,13 @@ class MemoxideClient:
         except Exception as e:
             logger.warning(f"Failed to send notification: {e}")
 
-    async def analyze_image(self, image_path: str, **kwargs) -> Optional[dict]:
+    async def analyze_image(
+        self,
+        image_path: str,
+        *,
+        timeout: float = MEMOXIDE_CALL_TIMEOUT,
+        **kwargs: Any,
+    ) -> Optional[dict]:
         """Analyze image and detect profile."""
         if not self.is_available():
             if not await self.start():
@@ -260,6 +342,7 @@ class MemoxideClient:
                 "name": "memory_analyze_image",
                 "arguments": params,
             },
+            timeout=timeout,
         )
 
         if result and "content" in result:
@@ -278,7 +361,12 @@ class MemoxideClient:
         return result
 
     async def run_plugin(
-        self, session_id: str, plugin: str, params: Optional[dict] = None
+        self,
+        session_id: str,
+        plugin: str,
+        params: Optional[dict] = None,
+        *,
+        timeout: float = MEMOXIDE_CALL_TIMEOUT,
     ) -> Optional[dict]:
         """Run a plugin via Rust engine."""
         if not self.is_available():
@@ -291,7 +379,7 @@ class MemoxideClient:
         if params:
             tool_params["params"] = params
 
-        result = await self.call_tool("memory_run_plugin", tool_params)
+        result = await self.call_tool("memory_run_plugin", tool_params, timeout=timeout)
 
         if result and "content" in result:
             for item in result["content"]:
@@ -303,11 +391,21 @@ class MemoxideClient:
 
         return result
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Optional[dict]:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        timeout: float = MEMOXIDE_CALL_TIMEOUT,
+    ) -> Optional[dict]:
         """Call any native Memoxide MCP tool and decode its JSON text result."""
         if not self.is_available() and not await self.start():
             return None
-        result = await self._send_request("tools/call", {"name": name, "arguments": arguments})
+        result = await self._send_request(
+            "tools/call",
+            {"name": name, "arguments": arguments},
+            timeout=timeout,
+        )
         if result and "content" in result:
             for item in result["content"]:
                 if item.get("type") == "text":
@@ -316,3 +414,11 @@ class MemoxideClient:
                     except json.JSONDecodeError:
                         return {"raw": item.get("text", "")}
         return result
+
+    @staticmethod
+    def _exit_status(returncode: Optional[int]) -> str:
+        if returncode is None:
+            return "returncode=unknown"
+        if returncode < 0:
+            return f"signal={-returncode}"
+        return f"returncode={returncode}"

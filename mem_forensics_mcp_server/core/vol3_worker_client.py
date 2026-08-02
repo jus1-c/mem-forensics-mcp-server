@@ -8,8 +8,11 @@ import inspect
 import json
 import logging
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
+
+import anyio
 
 from ..config import DEFAULT_DUMP_DIR, PLUGIN_TIMEOUT
 from .vol3_provider import Volatility3Provider, Volatility3Source, get_vol3_provider
@@ -30,12 +33,14 @@ class Vol3WorkerClient:
         self._request_lock = asyncio.Lock()
         self._stderr_task: Optional[asyncio.Task[None]] = None
         self._stderr_tail: list[str] = []
+        self._last_returncode: Optional[int] = None
+        self._protocol_open = False
         self.in_flight = 0
         self._leases = 0
 
     @property
     def is_available(self) -> bool:
-        return self._process is not None and self._process.returncode is None
+        return self._protocol_open and self._process is not None and self._process.returncode is None
 
     @property
     def busy(self) -> bool:
@@ -52,6 +57,9 @@ class Vol3WorkerClient:
     async def start(self) -> dict[str, Any]:
         if self.is_available:
             return await self.request("health", timeout=30)
+        if self._process is not None:
+            with anyio.CancelScope(shield=True):
+                await self.stop(force=True, reason="restart_unavailable")
         if not self.source.available:
             raise RuntimeError("No Volatility3 source is available")
 
@@ -71,30 +79,46 @@ class Vol3WorkerClient:
             stderr=asyncio.subprocess.PIPE,
             limit=64 * 1024 * 1024,
         )
+        self._last_returncode = None
+        self._protocol_open = True
+        logger.info("Started Volatility3 worker pid=%s source=%s", self._process.pid, self.source.to_dict())
         self._stderr_task = asyncio.create_task(self._drain_stderr(), name="vol3-worker-stderr")
         try:
             return await self.request("health", timeout=30)
+        except asyncio.CancelledError:
+            with anyio.CancelScope(shield=True):
+                await self.stop(force=True, reason="startup_failed")
+            raise
         except Exception:
-            await self.stop(force=True)
+            await self.stop(force=True, reason="startup_failed")
             raise
 
-    async def stop(self, *, force: bool = False) -> None:
+    async def stop(self, *, force: bool = False, reason: str = "requested") -> None:
         process = self._process
         self._process = None
+        self._protocol_open = False
         if process is not None and process.returncode is None:
             # A timeout/cancel can invoke stop while request() owns
             # _request_lock. Termination avoids recursively acquiring it.
-            if process.returncode is None:
+            logger.warning("Stopping Volatility3 worker pid=%s reason=%s", process.pid, reason)
+            try:
+                process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except (asyncio.TimeoutError, ProcessLookupError):
                 try:
-                    process.terminate()
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(process.wait(), timeout=5)
-                except (asyncio.TimeoutError, ProcessLookupError):
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-                    with contextlib.suppress(asyncio.TimeoutError):
-                        await asyncio.wait_for(process.wait(), timeout=5)
+        if process is not None:
+            self._last_returncode = process.returncode
+            logger.info(
+                "Volatility3 worker stopped pid=%s %s reason=%s",
+                process.pid,
+                self._exit_status(process.returncode),
+                reason,
+            )
         if self._stderr_task:
             self._stderr_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -111,7 +135,13 @@ class Vol3WorkerClient:
     ) -> dict[str, Any]:
         async with self._request_lock:
             process = self._process
-            if process is None or process.returncode is not None or process.stdin is None or process.stdout is None:
+            if (
+                not self._protocol_open
+                or process is None
+                or process.returncode is not None
+                or process.stdin is None
+                or process.stdout is None
+            ):
                 raise RuntimeError(self._worker_unavailable_message())
             self._request_id += 1
             request_id = self._request_id
@@ -124,10 +154,16 @@ class Vol3WorkerClient:
                     self._read_response(request_id, progress), timeout=timeout or self.call_timeout
                 )
             except asyncio.TimeoutError as exc:
-                await self.stop(force=True)
+                with anyio.CancelScope(shield=True):
+                    await self.stop(
+                        force=True,
+                        reason=f"request {request_id} {method} timed out after {timeout or self.call_timeout}s",
+                    )
                 raise TimeoutError(f"Volatility3 worker timed out after {timeout or self.call_timeout}s") from exc
             except asyncio.CancelledError:
-                await self.stop(force=True)
+                logger.warning("Volatility3 worker request cancelled id=%s method=%s", request_id, method)
+                with anyio.CancelScope(shield=True):
+                    await self.stop(force=True, reason=f"request {request_id} {method} cancelled")
                 raise
             finally:
                 self.in_flight -= 1
@@ -141,6 +177,8 @@ class Vol3WorkerClient:
         while True:
             line = await self._process.stdout.readline()
             if not line:
+                self._protocol_open = False
+                logger.warning("Volatility3 worker stdout closed %s", self._worker_unavailable_message())
                 raise RuntimeError(self._worker_unavailable_message())
             try:
                 message = json.loads(line)
@@ -182,7 +220,17 @@ class Vol3WorkerClient:
 
     def _worker_unavailable_message(self) -> str:
         tail = f" stderr: {' | '.join(self._stderr_tail[-3:])}" if self._stderr_tail else ""
-        return f"Volatility3 worker is unavailable.{tail}"
+        returncode = self._process.returncode if self._process is not None else self._last_returncode
+        status = f" {self._exit_status(returncode)}" if returncode is not None else ""
+        return f"Volatility3 worker is unavailable.{status}{tail}"
+
+    @staticmethod
+    def _exit_status(returncode: Optional[int]) -> str:
+        if returncode is None:
+            return "returncode=unknown"
+        if returncode < 0:
+            return f"signal={-returncode}"
+        return f"returncode={returncode}"
 
 
 class Vol3WorkerManager:
@@ -194,6 +242,9 @@ class Vol3WorkerManager:
         self._retired: list[Vol3WorkerClient] = []
         self._lock = asyncio.Lock()
         self._ensure_lock = asyncio.Lock()
+        self._execution_lock = asyncio.Lock()
+        self._catalog_lock = asyncio.Lock()
+        self._catalogs: dict[tuple[str, Optional[str], Optional[str], Optional[str]], dict[str, Any]] = {}
 
     async def initialize(self) -> Optional[dict[str, Any]]:
         # Do not import 197+ plugins on the MCP startup path. A local provider
@@ -210,35 +261,61 @@ class Vol3WorkerManager:
             self._current = None
             self._retired.clear()
         await asyncio.gather(*(client.stop(force=True) for client in clients), return_exceptions=True)
+        await self._clear_catalogs()
         await self.provider.close()
 
     async def health(self) -> dict[str, Any]:
         try:
-            client = await self._acquire_client()
-            try:
-                health = await client.request("health", timeout=30)
-            finally:
-                client.release()
-                await self._retire_idle()
+            health = await self._execute_request("health", timeout=30)
             return {"available": True, **health}
         except Exception as exc:
             return {"available": False, "error": str(exc), "provider": self.provider.status()}
 
     async def list_plugins(self) -> dict[str, Any]:
-        client = await self._acquire_client()
-        try:
-            return await client.request("list_plugins", timeout=60)
-        finally:
-            client.release()
-            await self._retire_idle()
+        cached = await self._cached_catalog()
+        if cached is not None:
+            return cached
+        async with self._execution_lock:
+            cached = await self._cached_catalog()
+            if cached is not None:
+                return cached
+            client = await self._acquire_client()
+            try:
+                catalog = await client.request("list_plugins", timeout=60)
+                await self._store_catalog(client.source, catalog)
+                return deepcopy(catalog)
+            finally:
+                client.release()
+                with anyio.CancelScope(shield=True):
+                    await self._retire_idle()
 
     async def describe_plugin(self, plugin: str) -> dict[str, Any]:
-        client = await self._acquire_client()
-        try:
-            return await client.request("describe_plugin", {"plugin": plugin}, timeout=60)
-        finally:
-            client.release()
-            await self._retire_idle()
+        catalog = await self.list_plugins()
+        descriptors = [
+            descriptor
+            for entries in catalog.get("plugins", {}).values()
+            if isinstance(entries, list)
+            for descriptor in entries
+            if isinstance(descriptor, dict)
+        ]
+        descriptor = next(
+            (item for item in descriptors if item.get("canonical_name") == plugin),
+            None,
+        )
+        if descriptor is None:
+            query = plugin.lower()
+            suggestions = [
+                str(item.get("canonical_name"))
+                for item in descriptors
+                if query in str(item.get("canonical_name", "")).lower()
+            ][:20]
+            detail = f" Details: {'; '.join(suggestions)}" if suggestions else ""
+            raise RuntimeError(f"plugin_not_found: Volatility3 plugin not found: {plugin}{detail}")
+        return {
+            "engine": "vol3",
+            "plugin": deepcopy(descriptor),
+            "volatility3": deepcopy(catalog.get("volatility3", {})),
+        }
 
     async def run_plugin(
         self,
@@ -251,24 +328,21 @@ class Vol3WorkerManager:
         timeout: float = PLUGIN_TIMEOUT,
         progress: Optional[ProgressCallback] = None,
     ) -> dict[str, Any]:
-        client = await self._acquire_client()
+        # Cache discovery metadata before a full-image operation monopolizes the worker.
+        await self.list_plugins()
         destination = (artifact_dir or DEFAULT_DUMP_DIR).resolve()
-        try:
-            return await client.request(
-                "run_plugin",
-                {
-                    "image_path": image_path,
-                    "plugin": plugin,
-                    "args": args or [],
-                    "plugin_params": params or {},
-                    "output_dir": str(destination),
-                },
-                timeout=timeout,
-                progress=progress,
-            )
-        finally:
-            client.release()
-            await self._retire_idle()
+        return await self._execute_request(
+            "run_plugin",
+            {
+                "image_path": image_path,
+                "plugin": plugin,
+                "args": args or [],
+                "plugin_params": params or {},
+                "output_dir": str(destination),
+            },
+            timeout=timeout,
+            progress=progress,
+        )
 
     async def promote_source(self, source: Volatility3Source) -> None:
         """Start a candidate before atomically routing new jobs to it."""
@@ -280,13 +354,16 @@ class Vol3WorkerManager:
             self.provider.invalidate_source(source, f"candidate worker bootstrap failed: {exc}")
             logger.warning("Rejected updated Volatility3 candidate: %s", exc)
             return
-        self.provider.mark_healthy(source)
-        async with self._lock:
-            old = self._current
-            self._current = candidate
-            if old is not None:
-                self._retired.append(old)
-        await self._retire_idle()
+        # Do not replace the source while an operation owns the metadata cache.
+        async with self._execution_lock:
+            async with self._lock:
+                old = self._current
+                self._current = candidate
+                if old is not None:
+                    self._retired.append(old)
+            self.provider.mark_healthy(source)
+            await self._clear_catalogs()
+            await self._retire_idle()
         await self._prune_inactive_worktrees()
 
     async def _ensure_current(self) -> dict[str, Any]:
@@ -305,7 +382,6 @@ class Vol3WorkerManager:
                 candidate = Vol3WorkerClient(source)
                 try:
                     health = await candidate.start()
-                    self.provider.mark_healthy(source)
                     async with self._lock:
                         old = self._current
                         if old is not None and old.is_available:
@@ -325,6 +401,7 @@ class Vol3WorkerManager:
                         finally:
                             winner.release()
                             await self._retire_idle()
+                    self.provider.mark_healthy(source)
                     await self._retire_idle()
                     return health
                 except Exception as exc:
@@ -350,6 +427,45 @@ class Vol3WorkerManager:
         await asyncio.gather(*(client.stop(force=True) for client in idle), return_exceptions=True)
         if idle:
             await self._prune_inactive_worktrees()
+
+    async def _execute_request(
+        self,
+        method: str,
+        params: Optional[dict[str, Any]] = None,
+        *,
+        timeout: float,
+        progress: Optional[ProgressCallback] = None,
+    ) -> dict[str, Any]:
+        """Serialize worker ownership so queued cancellation cannot kill another request's worker."""
+        async with self._execution_lock:
+            client = await self._acquire_client()
+            try:
+                return await client.request(method, params, timeout=timeout, progress=progress)
+            finally:
+                client.release()
+                with anyio.CancelScope(shield=True):
+                    await self._retire_idle()
+
+    async def _cached_catalog(self) -> Optional[dict[str, Any]]:
+        async with self._lock:
+            current = self._current
+            source = current.source if current is not None and current.is_available else None
+        source = source or self.provider.selected_source()
+        async with self._catalog_lock:
+            catalog = self._catalogs.get(self._source_key(source))
+            return deepcopy(catalog) if catalog is not None else None
+
+    async def _store_catalog(self, source: Volatility3Source, catalog: dict[str, Any]) -> None:
+        async with self._catalog_lock:
+            self._catalogs[self._source_key(source)] = deepcopy(catalog)
+
+    async def _clear_catalogs(self) -> None:
+        async with self._catalog_lock:
+            self._catalogs.clear()
+
+    @staticmethod
+    def _source_key(source: Volatility3Source) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
+        return source.kind, source.path, source.commit, source.package_version
 
     async def _prune_inactive_worktrees(self) -> None:
         """Keep every live worker source while pruning stale managed revisions."""

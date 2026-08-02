@@ -71,6 +71,8 @@ def test_session_capacity_retires_least_recently_used(tmp_path: Path, monkeypatc
 
 def test_close_session_closes_native_session(tmp_path: Path, monkeypatch) -> None:
     class Client:
+        generation = 1
+
         def is_available(self) -> bool:
             return True
 
@@ -84,6 +86,7 @@ def test_close_session_closes_native_session(tmp_path: Path, monkeypatch) -> Non
     session = get_session(image)
     assert session is not None
     session.rust_session_id = "native-session"
+    session.rust_generation = 1
     monkeypatch.setattr(server, "_memoxide", Client())
 
     result = asyncio.run(server._handle_close_session({"session_id": session.session_id}))
@@ -91,3 +94,23 @@ def test_close_session_closes_native_session(tmp_path: Path, monkeypatch) -> Non
     assert result.structuredContent["closed"] is True
     assert result.structuredContent["native_closed"] is True
     assert get_session_by_id(session.session_id) is None
+
+
+def test_list_sessions_hides_stale_native_generation(tmp_path: Path, monkeypatch) -> None:
+    class Client:
+        generation = 2
+
+        def is_available(self) -> bool:
+            return True
+
+    image = tmp_path / "image.raw"
+    image.write_bytes(b"memory")
+    session = get_session(image)
+    assert session is not None
+    session.rust_session_id = "stale-session"
+    session.rust_generation = 1
+    monkeypatch.setattr(server, "_memoxide", Client())
+
+    result = asyncio.run(server._handle_list_sessions())
+
+    assert result.structuredContent["sessions"][0]["rust_available"] is False
